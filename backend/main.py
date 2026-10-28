@@ -153,6 +153,7 @@ def root():
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     try:
         with engine.connect():
