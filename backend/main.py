@@ -3,7 +3,8 @@ import hashlib
 import hmac
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -12,12 +13,23 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from groq import Groq
 from pydantic import BaseModel, Field, EmailStr
+from sqlalchemy import text
 
 from database import Base, DATABASE_SOURCE, SessionLocal, engine
-from models import ChatMessage, Conversation, CorporateRole, Membership, RoleScope, User, Workspace
+from models import ChatMessage, Conversation, CorporateRole, Invitation, Membership, RoleScope, User, Workspace
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
+with engine.begin() as schema_db:
+    for statement in (
+        "ALTER TABLE users ADD COLUMN email_domain VARCHAR(255)",
+        "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
+        "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
+    ):
+        try:
+            schema_db.execute(text(statement))
+        except Exception:
+            pass
 app = FastAPI(title="Weber AI Corporate Intelligence API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -89,6 +101,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     company_name: str = Field(min_length=2, max_length=160)
+    company_website: str = Field(min_length=4, max_length=255)
     industry: str = Field(min_length=2, max_length=120)
     company_size: str = Field(min_length=1, max_length=80)
     job_title: str = Field(min_length=2, max_length=120)
@@ -120,6 +133,25 @@ class RoleCreate(BaseModel):
     scopes: list[str] = Field(default_factory=lambda: ["Workspace overview"])
 
 
+class InvitationRequest(BaseModel):
+    email: EmailStr
+    role_id: int
+
+
+def normalized_website(value: str) -> str:
+    website = value.strip()
+    if not website.startswith(("http://", "https://")):
+        website = "https://" + website
+    parsed = urlparse(website)
+    if not parsed.netloc or "." not in parsed.netloc:
+        raise HTTPException(status_code=422, detail="Enter the company website, for example https://company.com")
+    return website.rstrip("/")
+
+
+def website_domain(value: str) -> str:
+    return urlparse(normalized_website(value)).netloc.lower().removeprefix("www.").split(":")[0]
+
+
 def serialize_user(user: User):
     return {"id": user.id, "first_name": user.first_name, "last_name": user.last_name, "email": user.email, "job_title": user.job_title}
 
@@ -144,7 +176,7 @@ def bootstrap_payload(db, user: User):
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
-    return {"user": serialize_user(user), "workspace": {"id": workspace.id, "name": workspace.name, "industry": workspace.industry, "company_size": workspace.company_size}, "active_role": serialize_role(membership_role), "roles": [serialize_role(role) for role in roles], "conversation_id": conversation.id}
+    return {"user": serialize_user(user), "workspace": {"id": workspace.id, "name": workspace.name, "industry": workspace.industry, "company_size": workspace.company_size, "company_website": workspace.company_website, "domain_verification_status": workspace.domain_verification_status}, "active_role": serialize_role(membership_role), "roles": [serialize_role(role) for role in roles], "conversation_id": conversation.id}
 
 
 @app.get("/")
@@ -171,8 +203,11 @@ def signup(payload: SignupRequest):
         email = payload.email.lower().strip()
         if db.query(User).filter(User.email == email).first():
             raise HTTPException(status_code=409, detail="An account with this email already exists")
-        user = User(first_name=payload.first_name.strip(), last_name=payload.last_name.strip(), email=email, password_hash=hash_password(payload.password), job_title=payload.job_title.strip(), created_at=now())
-        workspace = Workspace(name=payload.company_name.strip(), industry=payload.industry.strip(), company_size=payload.company_size, created_at=now())
+        normalized_site = normalized_website(payload.company_website)
+        site_domain = website_domain(normalized_site)
+        email_domain = email.split("@", 1)[1].lower()
+        user = User(first_name=payload.first_name.strip(), last_name=payload.last_name.strip(), email=email, email_domain=email_domain, password_hash=hash_password(payload.password), job_title=payload.job_title.strip(), created_at=now())
+        workspace = Workspace(name=payload.company_name.strip(), industry=payload.industry.strip(), company_size=payload.company_size, company_website=normalized_site, domain_verification_status="verified" if email_domain == site_domain else "pending", created_at=now())
         db.add_all([user, workspace])
         db.flush()
         admin = CorporateRole(workspace_id=workspace.id, name="ADMIN", department="Executive office", description="Full workspace governance and role administration.", updated="Just now")
@@ -195,6 +230,25 @@ def login(payload: LoginRequest):
         if not user or not verify_password(payload.password, user.password_hash):
             raise HTTPException(status_code=401, detail="Email or password is incorrect")
         return {"access_token": issue_token(user.id), "token_type": "bearer", "bootstrap": bootstrap_payload(db, user)}
+    finally:
+        db.close()
+
+
+@app.post("/api/invitations")
+def create_invitation(payload: InvitationRequest, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, membership_role = workspace_for_user(db, user)
+        if membership_role.name != "ADMIN":
+            raise HTTPException(status_code=403, detail="Only ADMIN can invite employees")
+        role = db.query(CorporateRole).filter(CorporateRole.id == payload.role_id, CorporateRole.workspace_id == workspace.id).first()
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found in this workspace")
+        raw_token = secrets.token_urlsafe(32)
+        invitation = Invitation(workspace_id=workspace.id, role_id=role.id, invited_by=user.id, email=payload.email.lower().strip(), token_hash=hashlib.sha256(raw_token.encode()).hexdigest(), expires_at=(datetime.now(timezone.utc) + timedelta(days=7)).isoformat(), created_at=now())
+        db.add(invitation)
+        db.commit()
+        return {"id": invitation.id, "email": invitation.email, "role": role.name, "expires_at": invitation.expires_at, "invite_token": raw_token, "message": "Send this invitation through your approved company email channel. Weber AI never asks for the employee's other website password."}
     finally:
         db.close()
 

@@ -11,6 +11,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     job_title = Column(String(120), default="Workspace administrator")
+    email_domain = Column(String(255), default="")
     created_at = Column(String, nullable=False)
     memberships = relationship("Membership", back_populates="user", cascade="all, delete-orphan")
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
@@ -22,6 +23,8 @@ class Workspace(Base):
     name = Column(String(160), nullable=False)
     industry = Column(String(120), default="Corporate")
     company_size = Column(String(80), default="1-10")
+    company_website = Column(String(255), nullable=False, default="")
+    domain_verification_status = Column(String(30), default="pending")
     created_at = Column(String, nullable=False)
     memberships = relationship("Membership", back_populates="workspace", cascade="all, delete-orphan")
     roles = relationship("CorporateRole", back_populates="workspace", cascade="all, delete-orphan")
@@ -86,3 +89,16 @@ class RoleScope(Base):
     label = Column(String, nullable=False)
     role_id = Column(Integer, ForeignKey("corporate_roles.id"), nullable=False)
     role = relationship("CorporateRole", back_populates="scopes")
+
+
+class Invitation(Base):
+    __tablename__ = "invitations"
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    role_id = Column(Integer, ForeignKey("corporate_roles.id"), nullable=False)
+    invited_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    email = Column(String(255), nullable=False, index=True)
+    token_hash = Column(String(255), unique=True, nullable=False)
+    status = Column(String(20), default="pending")
+    expires_at = Column(String, nullable=False)
+    created_at = Column(String, nullable=False)
