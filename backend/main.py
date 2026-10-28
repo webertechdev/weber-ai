@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from groq import Groq
 from pydantic import BaseModel, Field, EmailStr
 
-from database import Base, SessionLocal, engine
+from database import Base, DATABASE_SOURCE, SessionLocal, engine
 from models import ChatMessage, Conversation, CorporateRole, Membership, RoleScope, User, Workspace
 
 load_dotenv()
@@ -25,7 +25,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, exc: Exception):
     print(f"Unhandled Weber AI error on {request.method} {request.url.path}: {exc}", flush=True)
-    return JSONResponse(status_code=500, content={"detail": "The Weber AI backend could not complete this request. Check DATABASE_URL, AUTH_SECRET, and deployment logs."})
+    return JSONResponse(status_code=500, content={"detail": "The Weber AI backend could not complete this request. Check the backend storage configuration and deployment logs.", "error_type": exc.__class__.__name__})
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=groq_api_key) if groq_api_key else None
@@ -154,7 +154,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "database": bool(os.getenv("DATABASE_URL")), "ai_provider": bool(groq_api_key)}
+    try:
+        with engine.connect():
+            database_ok = True
+    except Exception as exc:
+        print(f"Database health check failed: {exc}", flush=True)
+        database_ok = False
+    return {"status": "ok" if database_ok else "degraded", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
 
 
 @app.post("/api/auth/signup")
