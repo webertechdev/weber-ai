@@ -6,9 +6,9 @@ import secrets
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from groq import Groq
 from pydantic import BaseModel, Field, EmailStr
@@ -20,6 +20,12 @@ load_dotenv()
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="Weber AI Corporate Intelligence API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    print(f"Unhandled Weber AI error on {request.method} {request.url.path}: {exc}", flush=True)
+    return JSONResponse(status_code=500, content={"detail": "The Weber AI backend could not complete this request. Check DATABASE_URL, AUTH_SECRET, and deployment logs."})
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=groq_api_key) if groq_api_key else None
@@ -144,6 +150,11 @@ def bootstrap_payload(db, user: User):
 @app.get("/")
 def root():
     return {"message": "Weber AI Corporate Intelligence API is running"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "database": bool(os.getenv("DATABASE_URL")), "ai_provider": bool(groq_api_key)}
 
 
 @app.post("/api/auth/signup")
