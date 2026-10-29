@@ -235,14 +235,27 @@ def process_analysis(run_id: int):
             return
         run.status = "processing"
         db.commit()
-        analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "contextId": connector.browser_context_id, "persist": False, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}}) if connector.browser_context_id else None
-        connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
-        if not connect_url:
+        evidence = None
+        session_error = None
+        # The login Live View may still be active. Reuse it first; creating a
+        # second session against the same context returns Browserbase 409.
+        if connector.browser_connect_url:
+            try:
+                evidence = asyncio.run(inspect_browser_session(connector.browser_connect_url, connector.website_url, navigate=False))
+            except Exception as exc:
+                session_error = exc
+        if evidence is None and connector.browser_context_id:
+            analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "contextId": connector.browser_context_id, "persist": False, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}})
+            connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
+            if not connect_url:
+                raise RuntimeError("Browserbase did not return a connection URL for the authorized context")
+            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True))
+        if evidence is None:
             debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
             connect_url = connector.browser_connect_url or debug.get("wsUrl")
-        if not connect_url:
-            raise RuntimeError("The authorized Browserbase context is unavailable")
-        evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True))
+            if not connect_url:
+                raise RuntimeError(f"The authorized Browserbase session is unavailable: {session_error or 'session ended'}")
+            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=False))
         if evidence["password_fields"] > 0:
             run.status = "unavailable"
             run.unavailable_note = "The portal login page is still visible. Weber AI cannot inspect sales data until the authorized session is logged in."
