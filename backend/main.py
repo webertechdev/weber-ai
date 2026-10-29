@@ -1,6 +1,8 @@
 import base64
+import asyncio
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from groq import Groq
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import text
+import httpx
 
 from database import Base, DATABASE_SOURCE, SessionLocal, engine
 from models import AnalysisRun, ChatMessage, Connector, Conversation, CorporateRole, Invitation, Membership, Report, RoleScope, User, Workspace
@@ -25,6 +28,9 @@ with engine.begin() as schema_db:
         "ALTER TABLE users ADD COLUMN email_domain VARCHAR(255)",
         "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
         "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
+        "ALTER TABLE connectors ADD COLUMN browser_session_id VARCHAR(160)",
+        "ALTER TABLE connectors ADD COLUMN browser_live_view_url VARCHAR(1000)",
+        "ALTER TABLE connectors ADD COLUMN session_started_at VARCHAR(255)",
     ):
         try:
             schema_db.execute(text(statement))
@@ -41,6 +47,7 @@ async def unhandled_error(request: Request, exc: Exception):
 
 groq_api_key = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=groq_api_key) if groq_api_key else None
+BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY")
 TOKEN_SECRET = os.getenv("AUTH_SECRET", "weber-ai-change-this-secret")
 bearer = HTTPBearer(auto_error=False)
 
@@ -165,11 +172,45 @@ def website_domain(value: str) -> str:
 
 
 def serialize_connector(connector: Connector):
-    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "created_at": connector.created_at}
+    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "browser_session_id": connector.browser_session_id, "browser_live_view_url": connector.browser_live_view_url, "session_started_at": connector.session_started_at, "created_at": connector.created_at}
 
 
 def serialize_analysis(run: AnalysisRun):
     return {"id": run.id, "connector_id": run.connector_id, "request": run.request, "export_format": run.export_format, "status": run.status, "unavailable_note": run.unavailable_note, "result_text": run.result_text, "created_at": run.created_at, "completed_at": run.completed_at}
+
+
+def browserbase_json(method: str, path: str, payload: dict | None = None):
+    if not BROWSERBASE_API_KEY:
+        raise HTTPException(status_code=503, detail="Browserbase is not configured. Add BROWSERBASE_API_KEY to Vercel and redeploy.")
+    try:
+        with httpx.Client(timeout=25) as http:
+            response = http.request(method, f"https://api.browserbase.com{path}", headers={"X-BB-API-Key": BROWSERBASE_API_KEY, "Content-Type": "application/json"}, json=payload)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Browserbase could not complete the session request ({response.status_code}).")
+        return response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"Browserbase request failed: {exc}", flush=True)
+        raise HTTPException(status_code=502, detail="Browserbase is temporarily unavailable. Please try again.")
+
+
+async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False):
+    from playwright.async_api import async_playwright
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(connect_url)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
+        if navigate:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(800)
+        password_fields = await page.locator('input[type="password"]:visible').count()
+        visible_text = (await page.locator("body").inner_text(timeout=10000))[:120000]
+        tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+        screenshot = await page.screenshot(type="png")
+        current_url = page.url
+        # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
+        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot)}
 
 
 def serialize_user(user: User):
@@ -213,7 +254,7 @@ def health():
     except Exception as exc:
         print(f"Database health check failed: {exc}", flush=True)
         database_ok = False
-    return {"status": "ok" if database_ok else "degraded", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
+    return {"status": "ok" if database_ok else "degraded", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
 
 
 @app.post("/api/auth/signup")
@@ -354,9 +395,52 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
         if not connector:
             raise HTTPException(status_code=404, detail="Connector not found")
-        # This creates an auditable authorization request. A browser-worker/session bridge must
-        # complete the external login and callback before status becomes authorized.
-        return {"connector": serialize_connector(connector), "authorization_status": "authorization_required", "authorization_url": connector.website_url, "role": role.name, "message": "Open the website in the secure authorization session, sign in there, review the requested page scope, and approve access. Weber AI must not receive or store this website password."}
+        session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "keepAlive": True, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}})
+        session_id = session.get("id") or session.get("sessionId")
+        connect_url = session.get("connectUrl") or session.get("connect_url") or session.get("wsUrl")
+        if not session_id or not connect_url:
+            raise HTTPException(status_code=502, detail="Browserbase returned an incomplete browser session")
+        debug = browserbase_json("GET", f"/v1/sessions/{session_id}/debug")
+        live_view_url = debug.get("debuggerFullscreenUrl") or debug.get("debuggerUrl")
+        if not live_view_url:
+            raise HTTPException(status_code=502, detail="Browserbase did not return a Live View URL")
+        try:
+            asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True))
+        except Exception as exc:
+            print(f"Browserbase navigation failed: {exc}", flush=True)
+            raise HTTPException(status_code=502, detail="The secure browser session could not open the company website")
+        connector.browser_session_id = session_id
+        connector.browser_live_view_url = live_view_url
+        connector.session_started_at = now()
+        connector.status = "authorizing"
+        db.commit()
+        return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": live_view_url, "role": role.name, "message": "The secure Weber AI browser is ready. Sign in inside this Live View, then return to Weber AI and click Check login. Your website password stays inside the remote browser session."}
+    finally:
+        db.close()
+
+
+@app.post("/api/connectors/{connector_id}/check-login")
+def check_connector_login(connector_id: int, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
+        if not connector or not connector.browser_session_id:
+            raise HTTPException(status_code=409, detail="Start a secure authorization session first")
+        debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
+        connect_url = debug.get("wsUrl")
+        if not connect_url:
+            raise HTTPException(status_code=409, detail="The secure browser session has ended. Start authorization again.")
+        inspected = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
+        if inspected["password_fields"] > 0:
+            connector.status = "authorizing"
+            db.commit()
+            return {"connector": serialize_connector(connector), "authorized": False, "message": "The login page is still visible. Finish signing in inside the Weber AI Live View, then check again."}
+        connector.status = "authorized"
+        connector.last_authorized_at = now()
+        connector.allowed_scope = "Only pages visible in the user-authorized session"
+        db.commit()
+        return {"connector": serialize_connector(connector), "authorized": True, "message": "The user-authorized browser session is connected. Weber AI can now analyze only the visible session data."}
     finally:
         db.close()
 
