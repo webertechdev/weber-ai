@@ -14,11 +14,22 @@
 - [x] Provide reusable corporate analysis prompts for revenue, operations, workforce, risk, and executive briefing use cases.
 - [x] Add report-oriented insight cards that make outputs feel like business analysis rather than generic chat.
 
+## Secure website connectors
+- [x] Let a signed-in user connect the website used during signup or add another website URL.
+- [x] Require explicit authorization state before connector analysis; external passwords must never be sent to or stored by Weber AI.
+- [x] Limit analysis requests to the selected connector and record unavailable-information guidance until the authorized session is available.
+- [x] Start analysis only when the user clicks Analyze and let the user choose text, PDF, image, Word, Excel/CSV, or PowerPoint output intent.
+- [ ] Attach a separate browser-worker/session bridge that can receive the user-authorized session, extract/select large tables, and return temporary evidence.
+- [ ] Delete temporary screenshots/evidence after analysis while retaining generated reports for continuation and comparison.
+- [ ] Generate the selected PDF, image, Word, Excel/CSV, or PowerPoint artifact from completed analysis evidence.
+
 ## Service foundation
-- [x] Add SQLite-backed corporate role and role-scope models while keeping existing conversations and messages working.
-- [x] Add role list/create/update endpoints and accept an active role on streaming chat requests.
-- [x] Expose the single-page frontend route through the required route manifest.
+- [x] Use Neon PostgreSQL in production with local SQLite fallback for development.
+- [x] Add authenticated signup/login, workspace ownership, and ADMIN role creation.
+- [x] Add connector and analysis-run persistence plus report-ready API surfaces.
+- [ ] Keep the browser-worker/session bridge separate from the Vercel API so provider credentials remain outside Weber AI.
 
 ## Validation
 - [x] Keep the frontend lintable and buildable with the existing package scripts.
-- [x] Keep the backend importable with the existing requirements and avoid requiring a new external service for the role foundation.
+- [x] Keep the backend importable with the existing requirements.
+- [ ] Validate connector authorization state and report persistence against the live Neon deployment.

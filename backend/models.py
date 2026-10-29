@@ -102,3 +102,48 @@ class Invitation(Base):
     status = Column(String(20), default="pending")
     expires_at = Column(String, nullable=False)
     created_at = Column(String, nullable=False)
+
+
+class Connector(Base):
+    __tablename__ = "connectors"
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String(160), nullable=False)
+    website_url = Column(String(500), nullable=False)
+    connector_type = Column(String(40), default="browser_session")
+    status = Column(String(40), default="authorization_required")
+    allowed_scope = Column(Text, default="Only pages visible in the user-authorized session")
+    last_authorized_at = Column(String, nullable=True)
+    last_analysis_at = Column(String, nullable=True)
+    revoked_at = Column(String, nullable=True)
+    created_at = Column(String, nullable=False)
+
+
+class AnalysisRun(Base):
+    __tablename__ = "analysis_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    connector_id = Column(Integer, ForeignKey("connectors.id"), nullable=False)
+    role_id = Column(Integer, ForeignKey("corporate_roles.id"), nullable=True)
+    request = Column(Text, nullable=False)
+    export_format = Column(String(30), default="text")
+    status = Column(String(30), default="authorization_required")
+    unavailable_note = Column(Text, default="")
+    result_text = Column(Text, default="")
+    created_at = Column(String, nullable=False)
+    completed_at = Column(String, nullable=True)
+
+
+class Report(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    analysis_id = Column(Integer, ForeignKey("analysis_runs.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    export_format = Column(String(30), default="text")
+    content = Column(Text, nullable=False)
+    source_summary = Column(Text, default="")
+    created_at = Column(String, nullable=False)

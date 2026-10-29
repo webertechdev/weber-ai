@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import text
 
 from database import Base, DATABASE_SOURCE, SessionLocal, engine
-from models import ChatMessage, Conversation, CorporateRole, Invitation, Membership, RoleScope, User, Workspace
+from models import AnalysisRun, ChatMessage, Connector, Conversation, CorporateRole, Invitation, Membership, Report, RoleScope, User, Workspace
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -138,6 +138,18 @@ class InvitationRequest(BaseModel):
     role_id: int
 
 
+class ConnectorRequest(BaseModel):
+    website_url: str = Field(min_length=4, max_length=500)
+    name: str | None = Field(default=None, max_length=160)
+
+
+class AnalysisRequest(BaseModel):
+    connector_id: int
+    request: str = Field(min_length=3, max_length=5000)
+    export_format: str = Field(default="text", pattern="^(text|pdf|image|word|excel|csv|powerpoint)$")
+    role_id: int | None = None
+
+
 def normalized_website(value: str) -> str:
     website = value.strip()
     if not website.startswith(("http://", "https://")):
@@ -150,6 +162,14 @@ def normalized_website(value: str) -> str:
 
 def website_domain(value: str) -> str:
     return urlparse(normalized_website(value)).netloc.lower().removeprefix("www.").split(":")[0]
+
+
+def serialize_connector(connector: Connector):
+    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "created_at": connector.created_at}
+
+
+def serialize_analysis(run: AnalysisRun):
+    return {"id": run.id, "connector_id": run.connector_id, "request": run.request, "export_format": run.export_format, "status": run.status, "unavailable_note": run.unavailable_note, "result_text": run.result_text, "created_at": run.created_at, "completed_at": run.completed_at}
 
 
 def serialize_user(user: User):
@@ -296,6 +316,85 @@ def create_role(payload: RoleCreate, user: User = Depends(get_current_user)):
         db.commit()
         db.refresh(role)
         return serialize_role(role)
+    finally:
+        db.close()
+
+
+@app.get("/api/connectors")
+def get_connectors(user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        return [serialize_connector(item) for item in db.query(Connector).filter(Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).order_by(Connector.id).all()]
+    finally:
+        db.close()
+
+
+@app.post("/api/connectors")
+def create_connector(payload: ConnectorRequest, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        site = normalized_website(payload.website_url)
+        hostname = website_domain(site)
+        connector = Connector(workspace_id=workspace.id, created_by=user.id, name=(payload.name or hostname).strip(), website_url=site, created_at=now())
+        db.add(connector)
+        db.commit()
+        db.refresh(connector)
+        return serialize_connector(connector)
+    finally:
+        db.close()
+
+
+@app.post("/api/connectors/{connector_id}/authorize")
+def authorize_connector(connector_id: int, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, role = workspace_for_user(db, user)
+        connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
+        if not connector:
+            raise HTTPException(status_code=404, detail="Connector not found")
+        # This creates an auditable authorization request. A browser-worker/session bridge must
+        # complete the external login and callback before status becomes authorized.
+        return {"connector": serialize_connector(connector), "authorization_status": "authorization_required", "authorization_url": connector.website_url, "role": role.name, "message": "Open the website in the secure authorization session, sign in there, review the requested page scope, and approve access. Weber AI must not receive or store this website password."}
+    finally:
+        db.close()
+
+
+@app.post("/api/analysis")
+def create_analysis(payload: AnalysisRequest, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, role = workspace_for_user(db, user)
+        connector = db.query(Connector).filter(Connector.id == payload.connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
+        if not connector:
+            raise HTTPException(status_code=404, detail="Connector not found")
+        selected_role = db.query(CorporateRole).filter(CorporateRole.id == (payload.role_id or role.id), CorporateRole.workspace_id == workspace.id).first() or role
+        run = AnalysisRun(workspace_id=workspace.id, user_id=user.id, connector_id=connector.id, role_id=selected_role.id, request=payload.request, export_format=payload.export_format, status="authorization_required" if connector.status != "authorized" else "queued", unavailable_note="The requested information is not available until the user-authorized browser session is connected." if connector.status != "authorized" else "", created_at=now())
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return {"analysis": serialize_analysis(run), "next_step": "authorize_connector" if connector.status != "authorized" else "browser_worker_required"}
+    finally:
+        db.close()
+
+
+@app.get("/api/analysis")
+def get_analysis(user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        return [serialize_analysis(run) for run in db.query(AnalysisRun).filter(AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).order_by(AnalysisRun.id.desc()).all()]
+    finally:
+        db.close()
+
+
+@app.get("/api/reports")
+def get_reports(user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        return [{"id": report.id, "analysis_id": report.analysis_id, "title": report.title, "export_format": report.export_format, "content": report.content, "source_summary": report.source_summary, "created_at": report.created_at} for report in db.query(Report).filter(Report.workspace_id == workspace.id, Report.user_id == user.id).order_by(Report.id.desc()).all()]
     finally:
         db.close()
 
