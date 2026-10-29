@@ -23,19 +23,23 @@ from models import AnalysisRun, ChatMessage, Connector, Conversation, CorporateR
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
-with engine.begin() as schema_db:
-    for statement in (
-        "ALTER TABLE users ADD COLUMN email_domain VARCHAR(255)",
-        "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
-        "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
-        "ALTER TABLE connectors ADD COLUMN browser_session_id VARCHAR(160)",
-        "ALTER TABLE connectors ADD COLUMN browser_live_view_url VARCHAR(1000)",
-        "ALTER TABLE connectors ADD COLUMN session_started_at VARCHAR(255)",
-    ):
-        try:
-            schema_db.execute(text(statement))
-        except Exception:
-            pass
+for statement in (
+    "ALTER TABLE users ADD COLUMN email_domain VARCHAR(255)",
+    "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
+    "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
+    "ALTER TABLE connectors ADD COLUMN browser_session_id VARCHAR(160)",
+    "ALTER TABLE connectors ADD COLUMN browser_live_view_url VARCHAR(1000)",
+    "ALTER TABLE connectors ADD COLUMN session_started_at VARCHAR(255)",
+):
+    try:
+        # Each migration gets its own transaction. On Neon/Postgres a duplicate
+        # column error otherwise aborts the transaction and prevents later
+        # connector columns from being added.
+        safe_statement = statement.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ") if engine.dialect.name == "postgresql" else statement
+        with engine.begin() as schema_db:
+            schema_db.execute(text(safe_statement))
+    except Exception as exc:
+        print(f"Schema migration skipped: {exc}", flush=True)
 app = FastAPI(title="Weber AI Corporate Intelligence API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
