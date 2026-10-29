@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -215,6 +215,60 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         current_url = page.url
         # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
         return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot)}
+
+
+def process_analysis(run_id: int):
+    """Process a queued analysis after the API has returned the initial response."""
+    db = SessionLocal()
+    try:
+        run = db.query(AnalysisRun).filter(AnalysisRun.id == run_id).first()
+        if not run:
+            return
+        connector = db.query(Connector).filter(Connector.id == run.connector_id).first()
+        if not connector or connector.status != "authorized" or not connector.browser_session_id:
+            run.status = "unavailable"
+            run.unavailable_note = "The authorized browser session is no longer available. Authorize the connector again and retry this analysis."
+            run.completed_at = now()
+            db.commit()
+            return
+        run.status = "processing"
+        db.commit()
+        debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
+        connect_url = debug.get("wsUrl")
+        if not connect_url:
+            raise RuntimeError("The Browserbase session has ended")
+        evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
+        if evidence["password_fields"] > 0:
+            run.status = "unavailable"
+            run.unavailable_note = "The portal login page is still visible. Weber AI cannot inspect sales data until the authorized session is logged in."
+            run.completed_at = now()
+            db.commit()
+            return
+        evidence_text = json.dumps({"page_url": evidence["current_url"], "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:180000]
+        if client is None:
+            result = "The AI provider is not configured, so Weber AI could not generate this report."
+        else:
+            completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, messages=[
+                {"role": "system", "content": "You are Weber Intelligence. Produce a concise corporate sales report using only the supplied authorized browser evidence. Never invent numbers. If the evidence does not contain the requested period or metric, say it is unavailable and recommend an IT/data administrator review. Include conclusion, observed figures, comparison or trend, limitations, and next actions."},
+                {"role": "user", "content": f"Requested analysis: {run.request}\n\nAuthorized portal evidence:\n{evidence_text}"},
+            ])
+            result = completion.choices[0].message.content or "No report content was returned from the authorized evidence."
+        run.result_text = result
+        run.status = "completed"
+        run.completed_at = now()
+        connector.last_analysis_at = now()
+        db.add(Report(workspace_id=run.workspace_id, user_id=run.user_id, analysis_id=run.id, title=run.request[:180], export_format=run.export_format, content=result, source_summary=f"Authorized session: {connector.website_url}; visible page: {evidence['current_url']}", created_at=now()))
+        db.commit()
+    except Exception as exc:
+        print(f"Analysis {run_id} failed: {exc}", flush=True)
+        run = db.query(AnalysisRun).filter(AnalysisRun.id == run_id).first()
+        if run:
+            run.status = "failed"
+            run.unavailable_note = "Weber AI could not complete this report from the authorized session. Please retry or ask an IT administrator to check the portal connection."
+            run.completed_at = now()
+            db.commit()
+    finally:
+        db.close()
 
 
 def serialize_user(user: User):
@@ -459,7 +513,7 @@ def check_connector_login(connector_id: int, user: User = Depends(get_current_us
 
 
 @app.post("/api/analysis")
-def create_analysis(payload: AnalysisRequest, user: User = Depends(get_current_user)):
+def create_analysis(payload: AnalysisRequest, background_tasks: BackgroundTasks, user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
         workspace, role = workspace_for_user(db, user)
@@ -473,17 +527,24 @@ def create_analysis(payload: AnalysisRequest, user: User = Depends(get_current_u
         db.add(run)
         db.commit()
         db.refresh(run)
-        return {"analysis": serialize_analysis(run), "next_step": "authorize_connector" if connector.status != "authorized" else "browser_worker_required"}
+        background_tasks.add_task(process_analysis, run.id)
+        return {"analysis": serialize_analysis(run), "next_step": "processing_authorized_session"}
     finally:
         db.close()
 
 
 @app.get("/api/analysis")
-def get_analysis(user: User = Depends(get_current_user)):
+def get_analysis(background_tasks: BackgroundTasks, user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
         workspace, _ = workspace_for_user(db, user)
-        return [serialize_analysis(run) for run in db.query(AnalysisRun).filter(AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).order_by(AnalysisRun.id.desc()).all()]
+        runs = db.query(AnalysisRun).filter(AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).order_by(AnalysisRun.id.desc()).all()
+        for run in runs:
+            if run.status == "queued":
+                run.status = "processing"
+                background_tasks.add_task(process_analysis, run.id)
+        db.commit()
+        return [serialize_analysis(run) for run in runs]
     finally:
         db.close()
 
