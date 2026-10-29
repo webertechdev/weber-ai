@@ -369,8 +369,10 @@ def create_analysis(payload: AnalysisRequest, user: User = Depends(get_current_u
         connector = db.query(Connector).filter(Connector.id == payload.connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
         if not connector:
             raise HTTPException(status_code=404, detail="Connector not found")
+        if connector.status != "authorized":
+            raise HTTPException(status_code=409, detail="Authorize the connector in a secure browser session before starting an analysis")
         selected_role = db.query(CorporateRole).filter(CorporateRole.id == (payload.role_id or role.id), CorporateRole.workspace_id == workspace.id).first() or role
-        run = AnalysisRun(workspace_id=workspace.id, user_id=user.id, connector_id=connector.id, role_id=selected_role.id, request=payload.request, export_format=payload.export_format, status="authorization_required" if connector.status != "authorized" else "queued", unavailable_note="The requested information is not available until the user-authorized browser session is connected." if connector.status != "authorized" else "", created_at=now())
+        run = AnalysisRun(workspace_id=workspace.id, user_id=user.id, connector_id=connector.id, role_id=selected_role.id, request=payload.request, export_format=payload.export_format, status="queued", unavailable_note="", created_at=now())
         db.add(run)
         db.commit()
         db.refresh(run)
