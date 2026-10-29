@@ -395,7 +395,16 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
         if not connector:
             raise HTTPException(status_code=404, detail="Connector not found")
-        session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "keepAlive": True, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}})
+        session_payload = {"timeout": 900, "keepAlive": True, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}}
+        try:
+            session = browserbase_json("POST", "/v1/sessions", session_payload)
+        except HTTPException as exc:
+            # Some free Browserbase projects do not expose keepAlive. A normal
+            # 15-minute session still supports the interactive login handoff.
+            if exc.status_code != 502:
+                raise
+            session_payload.pop("keepAlive", None)
+            session = browserbase_json("POST", "/v1/sessions", session_payload)
         session_id = session.get("id") or session.get("sessionId")
         connect_url = session.get("connectUrl") or session.get("connect_url") or session.get("wsUrl")
         if not session_id or not connect_url:
