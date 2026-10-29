@@ -28,6 +28,7 @@ for statement in (
     "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
     "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
     "ALTER TABLE connectors ADD COLUMN browser_session_id VARCHAR(160)",
+    "ALTER TABLE connectors ADD COLUMN browser_context_id VARCHAR(160)",
     "ALTER TABLE connectors ADD COLUMN browser_connect_url VARCHAR(1000)",
     "ALTER TABLE connectors ADD COLUMN browser_live_view_url VARCHAR(1000)",
     "ALTER TABLE connectors ADD COLUMN session_started_at VARCHAR(255)",
@@ -177,7 +178,7 @@ def website_domain(value: str) -> str:
 
 
 def serialize_connector(connector: Connector):
-    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "browser_session_id": connector.browser_session_id, "browser_connect_url": connector.browser_connect_url, "browser_live_view_url": connector.browser_live_view_url, "session_started_at": connector.session_started_at, "created_at": connector.created_at}
+    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "browser_session_id": connector.browser_session_id, "browser_context_id": connector.browser_context_id, "browser_connect_url": connector.browser_connect_url, "browser_live_view_url": connector.browser_live_view_url, "session_started_at": connector.session_started_at, "created_at": connector.created_at}
 
 
 def serialize_analysis(run: AnalysisRun):
@@ -234,11 +235,14 @@ def process_analysis(run_id: int):
             return
         run.status = "processing"
         db.commit()
-        debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
-        connect_url = connector.browser_connect_url or debug.get("wsUrl")
+        analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "contextId": connector.browser_context_id, "persist": False, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}}) if connector.browser_context_id else None
+        connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
         if not connect_url:
-            raise RuntimeError("The Browserbase session has ended")
-        evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
+            debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
+            connect_url = connector.browser_connect_url or debug.get("wsUrl")
+        if not connect_url:
+            raise RuntimeError("The authorized Browserbase context is unavailable")
+        evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True))
         if evidence["password_fields"] > 0:
             run.status = "unavailable"
             run.unavailable_note = "The portal login page is still visible. Weber AI cannot inspect sales data until the authorized session is logged in."
@@ -454,7 +458,12 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
         if not connector:
             raise HTTPException(status_code=404, detail="Connector not found")
-        session_payload = {"timeout": 900, "keepAlive": True, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}}
+        if not connector.browser_context_id:
+            context = browserbase_json("POST", "/v1/contexts", {"name": f"weber-connector-{connector.id}"})
+            connector.browser_context_id = context.get("id") or context.get("contextId")
+            if not connector.browser_context_id:
+                raise HTTPException(status_code=502, detail="Browserbase did not return a persistent context")
+        session_payload = {"timeout": 900, "keepAlive": True, "contextId": connector.browser_context_id, "persist": True, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}}
         try:
             session = browserbase_json("POST", "/v1/sessions", session_payload)
         except HTTPException as exc:

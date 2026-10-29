@@ -118,6 +118,7 @@ class Connector(Base):
     last_analysis_at = Column(String, nullable=True)
     revoked_at = Column(String, nullable=True)
     browser_session_id = Column(String(160), nullable=True)
+    browser_context_id = Column(String(160), nullable=True)
     browser_connect_url = Column(String(1000), nullable=True)
     browser_live_view_url = Column(String(1000), nullable=True)
     session_started_at = Column(String, nullable=True)
