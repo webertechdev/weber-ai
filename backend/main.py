@@ -28,6 +28,7 @@ for statement in (
     "ALTER TABLE workspaces ADD COLUMN company_website VARCHAR(255)",
     "ALTER TABLE workspaces ADD COLUMN domain_verification_status VARCHAR(30)",
     "ALTER TABLE connectors ADD COLUMN browser_session_id VARCHAR(160)",
+    "ALTER TABLE connectors ADD COLUMN browser_connect_url VARCHAR(1000)",
     "ALTER TABLE connectors ADD COLUMN browser_live_view_url VARCHAR(1000)",
     "ALTER TABLE connectors ADD COLUMN session_started_at VARCHAR(255)",
 ):
@@ -176,7 +177,7 @@ def website_domain(value: str) -> str:
 
 
 def serialize_connector(connector: Connector):
-    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "browser_session_id": connector.browser_session_id, "browser_live_view_url": connector.browser_live_view_url, "session_started_at": connector.session_started_at, "created_at": connector.created_at}
+    return {"id": connector.id, "name": connector.name, "website_url": connector.website_url, "connector_type": connector.connector_type, "status": connector.status, "allowed_scope": connector.allowed_scope, "last_authorized_at": connector.last_authorized_at, "last_analysis_at": connector.last_analysis_at, "browser_session_id": connector.browser_session_id, "browser_connect_url": connector.browser_connect_url, "browser_live_view_url": connector.browser_live_view_url, "session_started_at": connector.session_started_at, "created_at": connector.created_at}
 
 
 def serialize_analysis(run: AnalysisRun):
@@ -234,7 +235,7 @@ def process_analysis(run_id: int):
         run.status = "processing"
         db.commit()
         debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
-        connect_url = debug.get("wsUrl")
+        connect_url = connector.browser_connect_url or debug.get("wsUrl")
         if not connect_url:
             raise RuntimeError("The Browserbase session has ended")
         evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
@@ -477,6 +478,7 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
             print(f"Browserbase navigation failed: {exc}", flush=True)
             raise HTTPException(status_code=502, detail="The secure browser session could not open the company website")
         connector.browser_session_id = session_id
+        connector.browser_connect_url = connect_url
         connector.browser_live_view_url = live_view_url
         connector.session_started_at = now()
         connector.status = "authorizing"
@@ -495,7 +497,7 @@ def check_connector_login(connector_id: int, user: User = Depends(get_current_us
         if not connector or not connector.browser_session_id:
             raise HTTPException(status_code=409, detail="Start a secure authorization session first")
         debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
-        connect_url = debug.get("wsUrl")
+        connect_url = connector.browser_connect_url or debug.get("wsUrl")
         if not connect_url:
             raise HTTPException(status_code=409, detail="The secure browser session has ended. Start authorization again.")
         inspected = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
