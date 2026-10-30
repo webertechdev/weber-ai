@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -472,12 +473,10 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
         if not connector:
             raise HTTPException(status_code=404, detail="Connector not found")
-        if connector.browser_session_id and connector.browser_live_view_url and connector.browser_connect_url:
+        if connector.browser_session_id:
             try:
-                browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
-                connector.status = "authorizing"
-                db.commit()
-                return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": connector.browser_live_view_url, "role": role.name, "message": "The existing secure browser session is still available. Sign in or finish the session in Live View, then return here and click Check login."}
+                browserbase_json("POST", f"/v1/sessions/{connector.browser_session_id}", {"status": "REQUEST_RELEASE"})
+                time.sleep(1.5)
             except HTTPException:
                 pass
         if not connector.browser_context_id:
@@ -499,7 +498,7 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connect_url = session.get("connectUrl") or session.get("connect_url") or session.get("wsUrl")
         if not session_id or not connect_url:
             raise HTTPException(status_code=502, detail="Browserbase returned an incomplete browser session")
-        debug = browserbase_json("GET", f"/v1/sessions/{session_id}/debug")
+        debug = browserbase_json("GET", f"/v1/sessions/{session_id}/debug?ttl=900")
         live_view_url = debug.get("debuggerFullscreenUrl") or debug.get("debuggerUrl")
         if not live_view_url:
             raise HTTPException(status_code=502, detail="Browserbase did not return a Live View URL")
