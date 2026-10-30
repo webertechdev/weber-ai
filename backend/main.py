@@ -55,6 +55,8 @@ async def unhandled_error(request: Request, exc: Exception):
 groq_api_key = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=groq_api_key) if groq_api_key else None
 BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY")
+BROWSER_WORKER_URL = os.getenv("BROWSER_WORKER_URL", "").strip().rstrip("/")
+BROWSER_WORKER_TOKEN = os.getenv("BROWSER_WORKER_TOKEN", "").strip()
 TOKEN_SECRET = os.getenv("AUTH_SECRET", "weber-ai-change-this-secret")
 bearer = HTTPBearer(auto_error=False)
 
@@ -187,22 +189,50 @@ def serialize_analysis(run: AnalysisRun):
 
 
 def browserbase_json(method: str, path: str, payload: dict | None = None):
-    if not BROWSERBASE_API_KEY:
-        raise HTTPException(status_code=503, detail="Browserbase is not configured. Add BROWSERBASE_API_KEY to Vercel and redeploy.")
-    try:
-        with httpx.Client(timeout=25) as http:
-            response = http.request(method, f"https://api.browserbase.com{path}", headers={"X-BB-API-Key": BROWSERBASE_API_KEY, "Content-Type": "application/json"}, json=payload)
-        if response.status_code >= 400:
-            provider_note = response.text.replace("\n", " ")[:240]
-            raise HTTPException(status_code=502, detail=f"Browserbase could not complete the session request ({response.status_code}). {provider_note}")
-        if response.status_code == 204 or not response.content:
-            return {}
-        return response.json()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"Browserbase request failed: {exc}", flush=True)
-        raise HTTPException(status_code=502, detail="Browserbase is temporarily unavailable. Please try again.")
+    """Call the managed provider, or fail over to a self-hosted Playwright worker.
+
+    The self-hosted worker intentionally implements the small Browserbase-compatible
+    session contract used by Weber AI. It can run on a persistent VM without browser-
+    minute quotas. If both providers are configured, Browserbase remains primary and
+    a quota/service failure retries the same request against the worker.
+    """
+    providers = []
+    if BROWSERBASE_API_KEY:
+        providers.append(("Browserbase", "https://api.browserbase.com", {"X-BB-API-Key": BROWSERBASE_API_KEY}))
+    if BROWSER_WORKER_URL:
+        worker_headers = {"Authorization": f"Bearer {BROWSER_WORKER_TOKEN}"} if BROWSER_WORKER_TOKEN else {}
+        providers.append(("self-hosted browser worker", BROWSER_WORKER_URL, worker_headers))
+    if not providers:
+        raise HTTPException(status_code=503, detail="No browser provider is configured. Add BROWSERBASE_API_KEY or BROWSER_WORKER_URL to Vercel and redeploy.")
+
+    failures = []
+    for provider_name, base_url, auth_headers in providers:
+        try:
+            headers = {**auth_headers, "Content-Type": "application/json"}
+            with httpx.Client(timeout=25) as http:
+                response = http.request(method, f"{base_url}{path}", headers=headers, json=payload)
+            if response.status_code >= 400:
+                provider_note = response.text.replace("\n", " ")[:500]
+                failures.append((provider_name, response.status_code, provider_note))
+                # A quota, rate, or transient provider failure should use the configured
+                # fallback. Validation and authentication errors must remain visible.
+                if response.status_code not in {402, 429, 500, 502, 503, 504} or provider_name == providers[-1][0]:
+                    public_status = response.status_code if response.status_code in {402, 401, 403, 404, 409, 422, 429} else 502
+                    fallback_note = " Configure BROWSER_WORKER_URL and BROWSER_WORKER_TOKEN to use a self-hosted Playwright fallback." if response.status_code == 402 and not BROWSER_WORKER_URL else ""
+                    raise HTTPException(status_code=public_status, detail=f"{provider_name} could not complete the session request ({response.status_code}). {provider_note}{fallback_note}")
+                continue
+            if response.status_code == 204 or not response.content:
+                return {}
+            return response.json()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            failures.append((provider_name, 503, str(exc)))
+            if provider_name == providers[-1][0]:
+                break
+
+    summary = "; ".join(f"{name}: {note}" for name, _, note in failures)
+    raise HTTPException(status_code=503, detail=f"All configured browser providers are unavailable. {summary[:900]}")
 
 
 async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False):
@@ -334,7 +364,8 @@ def health():
     except Exception as exc:
         print(f"Database health check failed: {exc}", flush=True)
         database_ok = False
-    return {"status": "ok" if database_ok else "degraded", "release": "browser-settings-context-authorization", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
+    browser_provider = "browserbase+fallback" if BROWSERBASE_API_KEY and BROWSER_WORKER_URL else "browserbase" if BROWSERBASE_API_KEY else "self-hosted" if BROWSER_WORKER_URL else "not-configured"
+    return {"status": "ok" if database_ok else "degraded", "release": "browser-settings-context-authorization-fallback", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY or BROWSER_WORKER_URL), "browser_provider": browser_provider, "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
 
 
 @app.post("/api/auth/signup")
