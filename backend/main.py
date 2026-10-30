@@ -249,7 +249,7 @@ def process_analysis(run_id: int):
             except Exception as exc:
                 session_error = exc
         if evidence is None and connector.browser_context_id:
-            analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "contextId": connector.browser_context_id, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}})
+            analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "browserSettings": {"context": {"id": connector.browser_context_id, "persist": False}}, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}})
             connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
             if not connect_url:
                 raise RuntimeError("Browserbase did not return a connection URL for the authorized context")
@@ -334,7 +334,7 @@ def health():
     except Exception as exc:
         print(f"Database health check failed: {exc}", flush=True)
         database_ok = False
-    return {"status": "ok" if database_ok else "degraded", "release": "unique-context-authorization", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
+    return {"status": "ok" if database_ok else "degraded", "release": "browser-settings-context-authorization", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
 
 
 @app.post("/api/auth/signup")
@@ -490,7 +490,7 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
             connector.browser_context_id = context.get("id") or context.get("contextId")
             if not connector.browser_context_id:
                 raise HTTPException(status_code=502, detail="Browserbase did not return a persistent context")
-        session_payload = {"timeout": 900, "keepAlive": True, "contextId": connector.browser_context_id, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}}
+        session_payload = {"timeout": 900, "keepAlive": True, "browserSettings": {"context": {"id": connector.browser_context_id, "persist": True}}, "region": "us-east-1", "userMetadata": {"connector_id": str(connector.id), "workspace_id": str(workspace.id), "user_id": str(user.id)}}
         try:
             session = browserbase_json("POST", "/v1/sessions", session_payload)
         except HTTPException as exc:
