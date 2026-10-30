@@ -195,6 +195,8 @@ def browserbase_json(method: str, path: str, payload: dict | None = None):
         if response.status_code >= 400:
             provider_note = response.text.replace("\n", " ")[:240]
             raise HTTPException(status_code=502, detail=f"Browserbase could not complete the session request ({response.status_code}). {provider_note}")
+        if response.status_code == 204 or not response.content:
+            return {}
         return response.json()
     except HTTPException:
         raise
@@ -535,6 +537,37 @@ def check_connector_login(connector_id: int, user: User = Depends(get_current_us
         connector.allowed_scope = "Only pages visible in the user-authorized session"
         db.commit()
         return {"connector": serialize_connector(connector), "authorized": True, "message": "The user-authorized browser session is connected. Weber AI can now analyze only the visible session data."}
+    finally:
+        db.close()
+
+
+@app.post("/api/connectors/{connector_id}/disconnect")
+def disconnect_connector(connector_id: int, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
+        if not connector:
+            raise HTTPException(status_code=404, detail="Connector not found")
+        if connector.browser_session_id:
+            try:
+                browserbase_json("POST", f"/v1/sessions/{connector.browser_session_id}", {"status": "REQUEST_RELEASE"})
+            except HTTPException:
+                pass
+        if connector.browser_context_id:
+            try:
+                browserbase_json("DELETE", f"/v1/contexts/{connector.browser_context_id}")
+            except HTTPException:
+                pass
+        connector.status = "authorization_required"
+        connector.browser_session_id = None
+        connector.browser_context_id = None
+        connector.browser_connect_url = None
+        connector.browser_live_view_url = None
+        connector.session_started_at = None
+        connector.last_authorized_at = None
+        db.commit()
+        return {"connector": serialize_connector(connector), "message": "Disconnected. The Browserbase session and saved website authorization have been removed."}
     finally:
         db.close()
 
