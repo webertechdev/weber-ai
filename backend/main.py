@@ -334,7 +334,7 @@ def health():
     except Exception as exc:
         print(f"Database health check failed: {exc}", flush=True)
         database_ok = False
-    return {"status": "ok" if database_ok else "degraded", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
+    return {"status": "ok" if database_ok else "degraded", "release": "unique-context-authorization", "database": database_ok, "database_source": DATABASE_SOURCE, "ai_provider": bool(groq_api_key), "browser_worker": bool(BROWSERBASE_API_KEY), "auth_secret_configured": bool(os.getenv("AUTH_SECRET"))}
 
 
 @app.post("/api/auth/signup")
