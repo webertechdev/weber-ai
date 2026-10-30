@@ -482,17 +482,11 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
             except HTTPException:
                 pass
         if not connector.browser_context_id:
-            context_name = f"weber-connector-{connector.id}"
-            try:
-                context = browserbase_json("POST", "/v1/contexts", {"name": context_name})
-            except HTTPException as exc:
-                if "(409)" not in str(exc.detail):
-                    raise
-                existing = browserbase_json("GET", "/v1/contexts")
-                candidates = existing.get("data", existing.get("contexts", existing if isinstance(existing, list) else []))
-                context = next((item for item in candidates if str(item.get("name", "")).lower() == context_name.lower()), None)
-                if not context:
-                    raise HTTPException(status_code=502, detail="Browserbase reported an existing context, but Weber could not retrieve it. Remove the stale context in Browserbase, then retry.")
+            # Disconnect deliberately clears the old context. Use a unique
+            # name so an orphaned Browserbase context can never block a new
+            # authorization with a 409 name conflict.
+            context_name = f"weber-connector-{connector.id}-{secrets.token_hex(6)}"
+            context = browserbase_json("POST", "/v1/contexts", {"name": context_name})
             connector.browser_context_id = context.get("id") or context.get("contextId")
             if not connector.browser_context_id:
                 raise HTTPException(status_code=502, detail="Browserbase did not return a persistent context")
