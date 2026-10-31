@@ -247,13 +247,27 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         worker_headers = {"Authorization": f"Bearer {BROWSER_WORKER_TOKEN}"} if BROWSER_WORKER_URL and connect_url.startswith(BROWSER_WORKER_URL) and BROWSER_WORKER_TOKEN else None
         browser = await playwright.chromium.connect_over_cdp(connect_url, headers=worker_headers)
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = context.pages[0] if context.pages else await context.new_page()
+        pages = context.pages or [await context.new_page()]
+        page = pages[0]
         if navigate:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(800)
+        # Browser sessions can contain an initial about:blank page plus the portal page.
+        # Choose the populated visible page so dashboard cards and sales tables are not lost.
+        candidates = []
+        for candidate in pages:
+            try:
+                text = (await candidate.locator("body").inner_text(timeout=5000)).strip()
+                table_data = await candidate.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+                candidates.append((len(text) + sum(len(row) for table in table_data for row in table) * 20, candidate, text, table_data))
+            except Exception:
+                continue
+        if candidates:
+            _, page, visible_text, tables = max(candidates, key=lambda item: item[0])
+        else:
+            visible_text, tables = "", []
         password_fields = await page.locator('input[type="password"]:visible').count()
-        visible_text = (await page.locator("body").inner_text(timeout=10000))[:120000]
-        tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+        visible_text = visible_text[:120000]
         screenshot = await page.screenshot(type="png")
         current_url = page.url
         # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
