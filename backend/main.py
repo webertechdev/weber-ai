@@ -216,10 +216,9 @@ def browserbase_json(method: str, path: str, payload: dict | None = None):
                 failures.append((provider_name, response.status_code, provider_note))
                 # A quota, rate, or transient provider failure should use the configured
                 # fallback. Validation and authentication errors must remain visible.
-                if response.status_code not in {402, 429, 500, 502, 503, 504} or provider_name == providers[-1][0]:
-                    public_status = response.status_code if response.status_code in {402, 401, 403, 404, 409, 422, 429} else 502
-                    fallback_note = " Configure BROWSER_WORKER_URL and BROWSER_WORKER_TOKEN to use a self-hosted Playwright fallback." if response.status_code == 402 and not BROWSER_WORKER_URL else ""
-                    raise HTTPException(status_code=public_status, detail=f"{provider_name} could not complete the session request ({response.status_code}). {provider_note}{fallback_note}")
+                if response.status_code not in {402, 429, 500, 502, 503, 504}:
+                    public_status = response.status_code if response.status_code in {401, 403, 404, 409, 422} else 502
+                    raise HTTPException(status_code=public_status, detail=f"{provider_name} could not complete the session request ({response.status_code}). {provider_note}")
                 continue
             if response.status_code == 204 or not response.content:
                 return {}
@@ -232,7 +231,14 @@ def browserbase_json(method: str, path: str, payload: dict | None = None):
                 break
 
     summary = "; ".join(f"{name}: {note}" for name, _, note in failures)
-    raise HTTPException(status_code=503, detail=f"All configured browser providers are unavailable. {summary[:900]}")
+    browserbase_quota_or_outage = any(name == "Browserbase" and code in {402, 429, 500, 502, 503, 504} for name, code, _ in failures)
+    if browserbase_quota_or_outage and BROWSER_WORKER_URL:
+        guidance = "Browserbase is unavailable or its browser quota is exceeded, so Weber tried the self-hosted alternative but could not reach it. Keep the local worker and HTTPS tunnel running, then retry Authorize session."
+    elif browserbase_quota_or_outage:
+        guidance = "Browserbase is unavailable or its browser quota is exceeded. Configure BROWSER_WORKER_URL and BROWSER_WORKER_TOKEN for the self-hosted Playwright alternative, then retry Authorize session."
+    else:
+        guidance = "Check the configured browser provider and retry Authorize session."
+    raise HTTPException(status_code=503, detail=f"{guidance} Provider details: {summary[:750]}")
 
 
 async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False):
