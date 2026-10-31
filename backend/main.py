@@ -551,7 +551,7 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector.session_started_at = now()
         connector.status = "authorizing"
         db.commit()
-        return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": live_view_url, "role": role.name, "message": "The secure Weber AI browser is ready. Sign in inside this Live View, then return to Weber AI and click Check login. Your website password stays inside the remote browser session."}
+        return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": live_view_url, "role": role.name, "message": "The secure Weber AI browser is ready. Sign in inside the secure browser view, then return to Weber AI and click Check login. Your website password stays inside the isolated browser session."}
     finally:
         db.close()
 
