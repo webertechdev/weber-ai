@@ -244,7 +244,8 @@ def browserbase_json(method: str, path: str, payload: dict | None = None):
 async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False):
     from playwright.async_api import async_playwright
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.connect_over_cdp(connect_url)
+        worker_headers = {"Authorization": f"Bearer {BROWSER_WORKER_TOKEN}"} if BROWSER_WORKER_URL and connect_url.startswith(BROWSER_WORKER_URL) and BROWSER_WORKER_TOKEN else None
+        browser = await playwright.chromium.connect_over_cdp(connect_url, headers=worker_headers)
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = context.pages[0] if context.pages else await context.new_page()
         if navigate:
@@ -609,6 +610,39 @@ def disconnect_connector(connector_id: int, user: User = Depends(get_current_use
         connector.last_authorized_at = None
         db.commit()
         return {"connector": serialize_connector(connector), "message": "Disconnected. The Browserbase session and saved website authorization have been removed."}
+    finally:
+        db.close()
+
+
+@app.delete("/api/connectors/{connector_id}")
+def delete_connector(connector_id: int, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, role = workspace_for_user(db, user)
+        if role.name != "ADMIN":
+            raise HTTPException(status_code=403, detail="Only ADMIN can delete website connectors")
+        connector = db.query(Connector).filter(Connector.id == connector_id, Connector.workspace_id == workspace.id, Connector.revoked_at.is_(None)).first()
+        if not connector:
+            raise HTTPException(status_code=404, detail="Connector not found")
+        if connector.browser_session_id:
+            try:
+                browserbase_json("POST", f"/v1/sessions/{connector.browser_session_id}", {"status": "REQUEST_RELEASE"})
+            except HTTPException:
+                pass
+        if connector.browser_context_id:
+            try:
+                browserbase_json("DELETE", f"/v1/contexts/{connector.browser_context_id}")
+            except HTTPException:
+                pass
+        connector.revoked_at = now()
+        connector.status = "deleted"
+        connector.browser_session_id = None
+        connector.browser_context_id = None
+        connector.browser_connect_url = None
+        connector.browser_live_view_url = None
+        connector.session_started_at = None
+        db.commit()
+        return {"deleted": True, "message": "Website connector deleted and its temporary browser session was released."}
     finally:
         db.close()
 
