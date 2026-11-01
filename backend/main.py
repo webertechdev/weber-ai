@@ -254,7 +254,11 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         page = pages[0]
         if navigate:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(800)
+        # Give the authenticated SPA time to render its dashboard after Live View
+        # login. Refresh context.pages because the portal may open a new tab after
+        # the initial about:blank page was created.
+        await page.wait_for_timeout(2500)
+        pages = context.pages or pages
         # Browser sessions can contain an initial about:blank page plus the portal page.
         # Choose the populated visible page so dashboard cards and sales tables are not lost.
         candidates = []
@@ -262,7 +266,9 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
             try:
                 text = (await candidate.locator("body").inner_text(timeout=5000)).strip()
                 table_data = await candidate.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
-                candidates.append((len(text) + sum(len(row) for table in table_data for row in table) * 20, candidate, text, table_data))
+                lower_text = text.lower()
+                signal_score = sum(1200 for signal in ("today's sales", "today’s sales", "today's profit", "today’s profit", "recent sales", "stock value", "employee", "payment") if signal in lower_text)
+                candidates.append((signal_score + len(text) + sum(len(row) for table in table_data for row in table) * 20, candidate, text, table_data))
             except Exception:
                 continue
         if candidates:
@@ -278,7 +284,7 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         if password_fields == 0:
             await page.evaluate("window.scrollTo(0, 0)")
             for _ in range(10):
-                await page.wait_for_timeout(250)
+                await page.wait_for_timeout(450)
                 scrolled_text = (await page.locator("body").inner_text(timeout=5000)).strip()
                 if scrolled_text and scrolled_text not in evidence_texts:
                     evidence_texts.append(scrolled_text)
