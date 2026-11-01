@@ -288,12 +288,34 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
                         evidence_tables.append(table)
                 await page.mouse.wheel(0, 850)
             await page.evaluate("window.scrollTo(0, 0)")
-        visible_text = "\n\n--- AGENTIC SCROLL PASS ---\n\n".join(evidence_texts)[:120000]
-        tables = evidence_tables[:60]
+        # Keep only new lines/rows. Browser body.inner_text often returns the whole
+        # document at every scroll position; sending those repeats can exceed the
+        # provider context and TPM limits even when the portal itself is small.
+        unique_lines = []
+        seen_lines = set()
+        for text_block in evidence_texts:
+            for raw_line in text_block.splitlines():
+                line = " ".join(raw_line.split()).strip()
+                if line and line not in seen_lines:
+                    seen_lines.add(line)
+                    unique_lines.append(line)
+        compact_tables = []
+        seen_rows = set()
+        for table in evidence_tables:
+            compact_table = []
+            for row in table[:80]:
+                normalized = tuple(" ".join(str(cell).split()).strip() for cell in row)
+                if normalized and normalized not in seen_rows:
+                    seen_rows.add(normalized)
+                    compact_table.append(list(normalized))
+            if compact_table:
+                compact_tables.append(compact_table)
+        visible_text = "\n".join(unique_lines)[:30000]
+        tables = compact_tables[:20]
         screenshot = await page.screenshot(type="png")
         current_url = page.url
         # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
-        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot), "agent_steps": len(evidence_texts)}
+        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot), "agent_steps": len(evidence_texts), "evidence_chars": len(visible_text)}
 
 
 def process_analysis(run_id: int):
@@ -339,14 +361,22 @@ def process_analysis(run_id: int):
             run.completed_at = now()
             db.commit()
             return
-        evidence_text = json.dumps({"page_url": evidence["current_url"], "agent_steps": evidence.get("agent_steps", 1), "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:180000]
+        evidence_text = json.dumps({"page_url": evidence["current_url"], "agent_steps": evidence.get("agent_steps", 1), "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:24000]
         if client is None:
             result = "The AI provider is not configured, so Weber AI could not generate this report."
         else:
-            completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, messages=[
-                {"role": "system", "content": "You are Weber Intelligence, a warm and concise corporate analyst. The browser agent has scrolled through the user-authorized portal and supplied DOM text and tables, not merely a screenshot. Use those visible records carefully, calculate only from supplied values, and never invent numbers. Acknowledge the user briefly, explain what you found, and if the requested period or metric is not visible say so plainly and recommend the next helpful step. Include observed figures, comparison or trend, limitations, and next actions."},
-                {"role": "user", "content": f"Requested analysis: {run.request}\n\nAuthorized portal evidence:\n{evidence_text}"},
-            ])
+            system_prompt = "You are Weber Intelligence, a warm and concise corporate analyst. Use only the supplied authorized portal evidence. Calculate only from supplied values and never invent numbers. Briefly explain what you found; if the requested period or metric is not visible, say so plainly and recommend the next helpful step. Include observed figures, comparison or trend, limitations, and next actions."
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Requested analysis: {run.request}\n\nAuthorized portal evidence:\n{evidence_text}"}]
+            try:
+                completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, max_tokens=1800, messages=messages)
+            except Exception as provider_error:
+                # A second compact attempt prevents a large portal from turning a
+                # recoverable context/TPM rejection into a failed report.
+                error_text = str(provider_error).lower()
+                if "context" not in error_text and "413" not in error_text and "too large" not in error_text and "tokens" not in error_text:
+                    raise
+                compact_evidence = evidence_text[:10000]
+                completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, max_tokens=1200, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Requested analysis: {run.request}\n\nCompact authorized portal evidence:\n{compact_evidence}"}])
             result = completion.choices[0].message.content or "No report content was returned from the authorized evidence."
         run.result_text = result
         run.status = "completed"
