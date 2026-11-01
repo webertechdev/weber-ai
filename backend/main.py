@@ -169,6 +169,11 @@ class AnalysisRequest(BaseModel):
     role_id: int | None = None
 
 
+class AnalysisEditRequest(BaseModel):
+    request: str = Field(min_length=3, max_length=5000)
+    export_format: str | None = Field(default=None, pattern="^(text|pdf|image|word|excel|csv|powerpoint)$")
+
+
 def normalized_website(value: str) -> str:
     website = value.strip()
     if not website.startswith(("http://", "https://")):
@@ -745,13 +750,49 @@ def get_analysis(background_tasks: BackgroundTasks, user: User = Depends(get_cur
     db = SessionLocal()
     try:
         workspace, _ = workspace_for_user(db, user)
-        runs = db.query(AnalysisRun).filter(AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).order_by(AnalysisRun.id.desc()).all()
+        runs = db.query(AnalysisRun).filter(AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id, AnalysisRun.status != "deleted").order_by(AnalysisRun.id.desc()).all()
         for run in runs:
             if run.status == "queued":
                 run.status = "processing"
                 background_tasks.add_task(process_analysis, run.id)
         db.commit()
         return [serialize_analysis(run) for run in runs]
+    finally:
+        db.close()
+
+
+@app.put("/api/analysis/{analysis_id}")
+def edit_analysis(analysis_id: int, payload: AnalysisEditRequest, background_tasks: BackgroundTasks, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        run = db.query(AnalysisRun).filter(AnalysisRun.id == analysis_id, AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id, AnalysisRun.status != "deleted").first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        if run.status == "processing":
+            raise HTTPException(status_code=409, detail="Please wait for the current analysis to finish before editing it")
+        run.request = payload.request
+        if payload.export_format:
+            run.export_format = payload.export_format
+        run.status = "queued"; run.result_text = ""; run.unavailable_note = ""; run.completed_at = None
+        db.commit(); background_tasks.add_task(process_analysis, run.id)
+        return {"analysis": serialize_analysis(run), "message": "I’ve updated your request and started a fresh governed analysis."}
+    finally:
+        db.close()
+
+
+@app.delete("/api/analysis/{analysis_id}")
+def delete_analysis(analysis_id: int, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        run = db.query(AnalysisRun).filter(AnalysisRun.id == analysis_id, AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id, AnalysisRun.status != "deleted").first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        for report in db.query(Report).filter(Report.analysis_id == run.id).all(): db.delete(report)
+        run.status = "deleted"; run.result_text = ""; run.unavailable_note = "Deleted by the user."; run.completed_at = now()
+        db.commit()
+        return {"deleted": True, "message": "The analysis and its saved report were safely removed."}
     finally:
         db.close()
 
@@ -767,7 +808,7 @@ def get_reports(user: User = Depends(get_current_user)):
 
 
 @app.get("/api/analysis/{analysis_id}/export")
-def export_analysis(analysis_id: int, format: str = "text", user: User = Depends(get_current_user)):
+def export_analysis(analysis_id: int, format: str = "text", include_question: bool = True, include_explanation: bool = True, user: User = Depends(get_current_user)):
     """Render the saved report into the requested downloadable file format."""
     db = SessionLocal()
     try:
@@ -775,53 +816,71 @@ def export_analysis(analysis_id: int, format: str = "text", user: User = Depends
         run = db.query(AnalysisRun).filter(AnalysisRun.id == analysis_id, AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).first()
         if not run or run.status != "completed":
             raise HTTPException(status_code=404, detail="A completed report is required before exporting")
+        role = db.query(CorporateRole).filter(CorporateRole.id == run.role_id, CorporateRole.workspace_id == workspace.id).first()
+        connector = db.query(Connector).filter(Connector.id == run.connector_id).first()
+        company_name = workspace.name or "Corporate workspace"
+        role_name = role.name if role else "Governed analyst"
         content = run.result_text or "No report content was returned."
+        report_body = content if include_explanation else "Detailed explanation omitted at the user’s request."
+        question_line = run.request if include_question else ""
         requested = format.lower().strip()
         safe_name = "weber-report-" + str(run.id)
         media_type = "text/plain; charset=utf-8"
         extension = "txt"
-        output = content.encode("utf-8")
+        output = report_body.encode("utf-8")
         if requested in {"text", "txt", "markdown", "md"}:
             extension = "txt"
         elif requested == "csv":
             buffer = io.StringIO(); writer = csv.writer(buffer)
-            writer.writerow(["Weber AI report", run.request]); writer.writerow(["Report content"])
-            for line in content.splitlines(): writer.writerow([line])
+            writer.writerow([company_name, "Weber AI report"]); writer.writerow(["Role", role_name]); writer.writerow(["Website", connector.website_url if connector else ""])
+            if include_question: writer.writerow(["Question", question_line])
+            writer.writerow(["Report content"])
+            for line in report_body.splitlines(): writer.writerow([line])
             output = buffer.getvalue().encode("utf-8"); media_type, extension = "text/csv; charset=utf-8", "csv"
         elif requested == "pdf":
             from reportlab.lib.pagesizes import A4
             from reportlab.pdfgen import canvas
-            buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4; y = height - 48
-            pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, y, "WEBER AI — Corporate Report"); y -= 26
-            pdf.setFont("Helvetica", 9); pdf.drawString(42, y, run.request[:115]); y -= 24
-            for raw_line in content.replace("**", "").replace("```", "").splitlines():
+            buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
+            def page_branding():
+                pdf.saveState(); pdf.translate(width / 2, height / 2); pdf.rotate(35); pdf.setFillColorRGB(.92, .92, .92); pdf.setFont("Helvetica-Bold", 44); pdf.drawCentredString(0, 0, company_name.upper()[:28]); pdf.restoreState()
+                pdf.setFillColorRGB(.15, .15, .15); pdf.setFont("Helvetica", 8); pdf.drawRightString(width - 42, 24, f"{company_name} · {role_name} · Weber AI")
+            page_branding(); y = height - 48
+            pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, y, f"{company_name} — Corporate Intelligence Report"); y -= 20
+            pdf.setFont("Helvetica", 9); pdf.drawString(42, y, f"Prepared by Weber AI · Role: {role_name}"); y -= 15
+            if connector: pdf.drawString(42, y, f"Source: {connector.website_url}"); y -= 15
+            if include_question: pdf.drawString(42, y, question_line[:115]); y -= 22
+            for raw_line in report_body.replace("**", "").replace("```", "").splitlines():
                 for line in textwrap.wrap(raw_line, width=105) or [""]:
-                    if y < 44: pdf.showPage(); y = height - 48; pdf.setFont("Helvetica", 9)
+                    if y < 44: pdf.showPage(); page_branding(); y = height - 48; pdf.setFont("Helvetica", 9)
                     pdf.drawString(42, y, line[:130]); y -= 13
             pdf.save(); output = buffer.getvalue(); media_type, extension = "application/pdf", "pdf"
         elif requested in {"word", "docx"}:
             from docx import Document
-            document = Document(); document.add_heading("WEBER AI — Corporate Report", 0); document.add_paragraph(run.request)
-            for line in content.splitlines(): document.add_paragraph(line.replace("**", ""))
+            document = Document(); document.add_heading(f"{company_name} — Corporate Report", 0); document.add_paragraph(f"Role: {role_name}")
+            if connector: document.add_paragraph(f"Source: {connector.website_url}")
+            if include_question: document.add_paragraph(question_line)
+            for line in report_body.splitlines(): document.add_paragraph(line.replace("**", ""))
             buffer = io.BytesIO(); document.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"
         elif requested in {"excel", "xlsx"}:
             from openpyxl import Workbook
             workbook = Workbook(); sheet = workbook.active; sheet.title = "Weber Report"
-            sheet.append(["WEBER AI — Corporate Report"]); sheet.append([run.request]); sheet.append([])
-            for line in content.splitlines(): sheet.append([line])
+            sheet.append([company_name, "Corporate Report"]); sheet.append(["Role", role_name]); sheet.append(["Website", connector.website_url if connector else ""])
+            if include_question: sheet.append(["Question", question_line])
+            sheet.append([])
+            for line in report_body.splitlines(): sheet.append([line])
             buffer = io.BytesIO(); workbook.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
         elif requested in {"powerpoint", "ppt", "pptx"}:
             from pptx import Presentation
-            presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = "WEBER AI — Corporate Report"; slide.placeholders[1].text = run.request
-            for chunk in textwrap.wrap(content.replace("**", ""), width=850):
+            presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = f"{company_name} — Corporate Report"; slide.placeholders[1].text = f"Role: {role_name}" + (f"\n{question_line}" if include_question else "")
+            for chunk in textwrap.wrap(report_body.replace("**", ""), width=850):
                 slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = "Findings"; slide.placeholders[1].text = chunk
             buffer = io.BytesIO(); presentation.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"
         elif requested in {"image", "png", "jpg", "jpeg"}:
             from PIL import Image, ImageDraw
             lines = []
-            for raw_line in content.replace("**", "").splitlines(): lines.extend(textwrap.wrap(raw_line, width=95) or [""])
+            for raw_line in report_body.replace("**", "").splitlines(): lines.extend(textwrap.wrap(raw_line, width=95) or [""])
             image = Image.new("RGB", (1400, max(260, 120 + len(lines) * 24)), "#f8f6f1"); draw = ImageDraw.Draw(image)
-            draw.text((60, 40), "WEBER AI — Corporate Report", fill="#171717"); draw.text((60, 80), run.request[:120], fill="#6f6a62")
+            draw.text((60, 40), f"{company_name} — Corporate Report", fill="#171717"); draw.text((60, 80), f"Role: {role_name}", fill="#6f6a62")
             for index, line in enumerate(lines): draw.text((60, 130 + index * 24), line, fill="#2f2b27")
             buffer = io.BytesIO(); image.save(buffer, format="PNG"); output = buffer.getvalue(); media_type, extension = "image/png", "png"
         else:
