@@ -7,3 +7,8 @@ email-validator
 psycopg[binary]
 httpx
 playwright
+reportlab
+python-docx
+openpyxl
+python-pptx
+Pillow

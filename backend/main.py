@@ -1,11 +1,14 @@
 import base64
 import asyncio
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
 import time
+import textwrap
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -267,11 +270,30 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         else:
             visible_text, tables = "", []
         password_fields = await page.locator('input[type="password"]:visible').count()
-        visible_text = visible_text[:120000]
+        # Agentic evidence pass: move through the visible page in bounded steps and
+        # collect DOM text/tables from each viewport. This is safer and more reliable
+        # than relying on one screenshot, while remaining inside the user-authorized tab.
+        evidence_texts = [visible_text] if visible_text else []
+        evidence_tables = list(tables)
+        if password_fields == 0:
+            await page.evaluate("window.scrollTo(0, 0)")
+            for _ in range(10):
+                await page.wait_for_timeout(250)
+                scrolled_text = (await page.locator("body").inner_text(timeout=5000)).strip()
+                if scrolled_text and scrolled_text not in evidence_texts:
+                    evidence_texts.append(scrolled_text)
+                scrolled_tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+                for table in scrolled_tables:
+                    if table not in evidence_tables:
+                        evidence_tables.append(table)
+                await page.mouse.wheel(0, 850)
+            await page.evaluate("window.scrollTo(0, 0)")
+        visible_text = "\n\n--- AGENTIC SCROLL PASS ---\n\n".join(evidence_texts)[:120000]
+        tables = evidence_tables[:60]
         screenshot = await page.screenshot(type="png")
         current_url = page.url
         # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
-        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot)}
+        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot), "agent_steps": len(evidence_texts)}
 
 
 def process_analysis(run_id: int):
@@ -317,12 +339,12 @@ def process_analysis(run_id: int):
             run.completed_at = now()
             db.commit()
             return
-        evidence_text = json.dumps({"page_url": evidence["current_url"], "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:180000]
+        evidence_text = json.dumps({"page_url": evidence["current_url"], "agent_steps": evidence.get("agent_steps", 1), "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:180000]
         if client is None:
             result = "The AI provider is not configured, so Weber AI could not generate this report."
         else:
             completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, messages=[
-                {"role": "system", "content": "You are Weber Intelligence. Produce a concise corporate sales report using only the supplied authorized browser evidence. Never invent numbers. If the evidence does not contain the requested period or metric, say it is unavailable and recommend an IT/data administrator review. Include conclusion, observed figures, comparison or trend, limitations, and next actions."},
+                {"role": "system", "content": "You are Weber Intelligence, a warm and concise corporate analyst. The browser agent has scrolled through the user-authorized portal and supplied DOM text and tables, not merely a screenshot. Use those visible records carefully, calculate only from supplied values, and never invent numbers. Acknowledge the user briefly, explain what you found, and if the requested period or metric is not visible say so plainly and recommend the next helpful step. Include observed figures, comparison or trend, limitations, and next actions."},
                 {"role": "user", "content": f"Requested analysis: {run.request}\n\nAuthorized portal evidence:\n{evidence_text}"},
             ])
             result = completion.choices[0].message.content or "No report content was returned from the authorized evidence."
@@ -704,6 +726,71 @@ def get_reports(user: User = Depends(get_current_user)):
     try:
         workspace, _ = workspace_for_user(db, user)
         return [{"id": report.id, "analysis_id": report.analysis_id, "title": report.title, "export_format": report.export_format, "content": report.content, "source_summary": report.source_summary, "created_at": report.created_at} for report in db.query(Report).filter(Report.workspace_id == workspace.id, Report.user_id == user.id).order_by(Report.id.desc()).all()]
+    finally:
+        db.close()
+
+
+@app.get("/api/analysis/{analysis_id}/export")
+def export_analysis(analysis_id: int, format: str = "text", user: User = Depends(get_current_user)):
+    """Render the saved report into the requested downloadable file format."""
+    db = SessionLocal()
+    try:
+        workspace, _ = workspace_for_user(db, user)
+        run = db.query(AnalysisRun).filter(AnalysisRun.id == analysis_id, AnalysisRun.workspace_id == workspace.id, AnalysisRun.user_id == user.id).first()
+        if not run or run.status != "completed":
+            raise HTTPException(status_code=404, detail="A completed report is required before exporting")
+        content = run.result_text or "No report content was returned."
+        requested = format.lower().strip()
+        safe_name = "weber-report-" + str(run.id)
+        media_type = "text/plain; charset=utf-8"
+        extension = "txt"
+        output = content.encode("utf-8")
+        if requested in {"text", "txt", "markdown", "md"}:
+            extension = "txt"
+        elif requested == "csv":
+            buffer = io.StringIO(); writer = csv.writer(buffer)
+            writer.writerow(["Weber AI report", run.request]); writer.writerow(["Report content"])
+            for line in content.splitlines(): writer.writerow([line])
+            output = buffer.getvalue().encode("utf-8"); media_type, extension = "text/csv; charset=utf-8", "csv"
+        elif requested == "pdf":
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4; y = height - 48
+            pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, y, "WEBER AI — Corporate Report"); y -= 26
+            pdf.setFont("Helvetica", 9); pdf.drawString(42, y, run.request[:115]); y -= 24
+            for raw_line in content.replace("**", "").replace("```", "").splitlines():
+                for line in textwrap.wrap(raw_line, width=105) or [""]:
+                    if y < 44: pdf.showPage(); y = height - 48; pdf.setFont("Helvetica", 9)
+                    pdf.drawString(42, y, line[:130]); y -= 13
+            pdf.save(); output = buffer.getvalue(); media_type, extension = "application/pdf", "pdf"
+        elif requested in {"word", "docx"}:
+            from docx import Document
+            document = Document(); document.add_heading("WEBER AI — Corporate Report", 0); document.add_paragraph(run.request)
+            for line in content.splitlines(): document.add_paragraph(line.replace("**", ""))
+            buffer = io.BytesIO(); document.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"
+        elif requested in {"excel", "xlsx"}:
+            from openpyxl import Workbook
+            workbook = Workbook(); sheet = workbook.active; sheet.title = "Weber Report"
+            sheet.append(["WEBER AI — Corporate Report"]); sheet.append([run.request]); sheet.append([])
+            for line in content.splitlines(): sheet.append([line])
+            buffer = io.BytesIO(); workbook.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+        elif requested in {"powerpoint", "ppt", "pptx"}:
+            from pptx import Presentation
+            presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = "WEBER AI — Corporate Report"; slide.placeholders[1].text = run.request
+            for chunk in textwrap.wrap(content.replace("**", ""), width=850):
+                slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = "Findings"; slide.placeholders[1].text = chunk
+            buffer = io.BytesIO(); presentation.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"
+        elif requested in {"image", "png", "jpg", "jpeg"}:
+            from PIL import Image, ImageDraw
+            lines = []
+            for raw_line in content.replace("**", "").splitlines(): lines.extend(textwrap.wrap(raw_line, width=95) or [""])
+            image = Image.new("RGB", (1400, max(260, 120 + len(lines) * 24)), "#f8f6f1"); draw = ImageDraw.Draw(image)
+            draw.text((60, 40), "WEBER AI — Corporate Report", fill="#171717"); draw.text((60, 80), run.request[:120], fill="#6f6a62")
+            for index, line in enumerate(lines): draw.text((60, 130 + index * 24), line, fill="#2f2b27")
+            buffer = io.BytesIO(); image.save(buffer, format="PNG"); output = buffer.getvalue(); media_type, extension = "image/png", "png"
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported export format")
+        return StreamingResponse(io.BytesIO(output), media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{safe_name}.{extension}"'})
     finally:
         db.close()
 
