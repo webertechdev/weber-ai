@@ -249,7 +249,91 @@ def browserbase_json(method: str, path: str, payload: dict | None = None):
     raise HTTPException(status_code=503, detail=f"{guidance} Provider details: {summary[:750]}")
 
 
-async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False):
+def _safe_agent_target(text: str) -> bool:
+    blocked = ("delete", "remove", "destroy", "logout", "log out", "password", "change password", "payment", "pay now", "send", "submit", "settings", "admin", "user management")
+    return not any(word in (text or "").lower() for word in blocked)
+
+
+def _scope_allows_agent_target(text: str, role_scopes: list[str]) -> bool:
+    if not role_scopes or any(scope.lower() in {"admin", "all company data", "all data"} for scope in role_scopes):
+        return True
+    target = (text or "").lower()
+    scope_text = " ".join(role_scopes).lower()
+    aliases = {"sales": "revenue margin sales orders", "revenue": "revenue margin sales orders", "profit": "revenue margin sales orders", "forecast": "forecast forecasting", "inventory": "inventory stock products", "customer": "customers customer", "report": "reports executive reporting"}
+    return any(keyword in target and any(scope_word in scope_text for scope_word in aliases[keyword].split()) for keyword in aliases)
+
+
+async def _page_snapshot(page):
+    text = (await page.locator("body").inner_text(timeout=5000)).strip()
+    tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 20).map(table => Array.from(table.querySelectorAll('tr')).slice(0, 80).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+    controls = await page.locator("a,button,[role='button'],input,select").evaluate_all("els => els.slice(0, 80).map((el, i) => { el.setAttribute('data-weber-agent-id', String(i)); return {id:String(i), tag:el.tagName.toLowerCase(), text:(el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.value || '').trim().slice(0,120), href:el.href || ''}; }).filter(x => x.text || x.href)")
+    return {"url": page.url, "title": await page.title(), "text": text[:18000], "tables": tables, "controls": controls}
+
+
+async def _run_governed_agent(page, request: str, role_scopes: list[str]):
+    """Let the model choose bounded browser actions, never unrestricted clicks."""
+    evidence = []
+    actions = []
+    max_steps = 8
+    for step in range(max_steps):
+        snapshot = await _page_snapshot(page)
+        evidence.append(snapshot)
+        if client is None:
+            action = {"action": "scroll", "amount": 850, "reason": "Read the next visible portion"} if step < max_steps - 1 else {"action": "finish", "reason": "Bounded evidence collection complete"}
+        else:
+            planner_prompt = {
+                "request": request,
+                "role_scopes": role_scopes,
+                "step": step + 1,
+                "max_steps": max_steps,
+                "page": snapshot,
+                "allowed_actions": ["scroll", "click", "wait", "finish"],
+                "policy": "Use only same-site visible controls. Never click destructive, account, password, payment, logout, admin, settings, edit, delete, remove, or submit controls. Finish when the visible evidence answers the request. Return JSON only with action, reason, and optional target_id/amount."
+            }
+            completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0, max_tokens=240, messages=[
+                {"role": "system", "content": "You are Weber's browser-action planner. Choose one safe, reversible action from the supplied visible page. Do not invent element ids. Return strict JSON only."},
+                {"role": "user", "content": json.dumps(planner_prompt, ensure_ascii=False)[:22000]}
+            ])
+            raw = completion.choices[0].message.content or "{}"
+            try:
+                raw = raw[raw.find("{"):raw.rfind("}") + 1]
+                action = json.loads(raw)
+            except Exception:
+                action = {"action": "finish", "reason": "The action planner returned an invalid command"}
+        action_name = str(action.get("action", "finish")).lower()
+        reason = str(action.get("reason", ""))[:240]
+        if action_name == "finish":
+            actions.append({"step": step + 1, "action": "finish", "reason": reason or "Evidence is sufficient"})
+            break
+        if action_name == "scroll":
+            amount = max(300, min(int(action.get("amount", 850)), 1200))
+            await page.mouse.wheel(0, amount)
+            await page.wait_for_timeout(650)
+            actions.append({"step": step + 1, "action": "scroll", "amount": amount, "reason": reason})
+            continue
+        if action_name == "wait":
+            await page.wait_for_timeout(1200)
+            actions.append({"step": step + 1, "action": "wait", "reason": reason})
+            continue
+        if action_name == "click":
+            target_id = str(action.get("target_id", ""))
+            candidate = next((item for item in snapshot["controls"] if item["id"] == target_id), None)
+            if not candidate or not _safe_agent_target(candidate.get("text", "")) or not _safe_agent_target(candidate.get("href", "")) or not _scope_allows_agent_target(candidate.get("text", "") + " " + candidate.get("href", ""), role_scopes):
+                actions.append({"step": step + 1, "action": "blocked_click", "target_id": target_id, "reason": "Target was missing or outside Weber's safe action policy"})
+                continue
+            href = candidate.get("href", "")
+            if href and urlparse(href).netloc and urlparse(href).netloc != urlparse(page.url).netloc:
+                actions.append({"step": step + 1, "action": "blocked_navigation", "reason": "External navigation is not allowed"})
+                continue
+            await page.locator(f"[data-weber-agent-id='{target_id}']").click(timeout=5000)
+            await page.wait_for_timeout(900)
+            actions.append({"step": step + 1, "action": "click", "target": candidate.get("text", "")[:120], "reason": reason})
+            continue
+        actions.append({"step": step + 1, "action": "blocked_action", "reason": "Unsupported action"})
+    return evidence, actions
+
+
+async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False, request: str = "", role_scopes: list[str] | None = None):
     from playwright.async_api import async_playwright
     async with async_playwright() as playwright:
         worker_headers = {"Authorization": f"Bearer {BROWSER_WORKER_TOKEN}"} if BROWSER_WORKER_URL and connect_url.startswith(BROWSER_WORKER_URL) and BROWSER_WORKER_TOKEN else None
@@ -286,19 +370,14 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         # than relying on one screenshot, while remaining inside the user-authorized tab.
         evidence_texts = [visible_text] if visible_text else []
         evidence_tables = list(tables)
+        agent_evidence, agent_actions = ([], [])
         if password_fields == 0:
             await page.evaluate("window.scrollTo(0, 0)")
-            for _ in range(10):
-                await page.wait_for_timeout(450)
-                scrolled_text = (await page.locator("body").inner_text(timeout=5000)).strip()
-                if scrolled_text and scrolled_text not in evidence_texts:
-                    evidence_texts.append(scrolled_text)
-                scrolled_tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
-                for table in scrolled_tables:
-                    if table not in evidence_tables:
-                        evidence_tables.append(table)
-                await page.mouse.wheel(0, 850)
-            await page.evaluate("window.scrollTo(0, 0)")
+            agent_evidence, agent_actions = await _run_governed_agent(page, request, role_scopes or [])
+            for snapshot in agent_evidence:
+                if snapshot.get("text"): evidence_texts.append(snapshot["text"])
+                for table in snapshot.get("tables", []):
+                    if table not in evidence_tables: evidence_tables.append(table)
         # Keep only new lines/rows. Browser body.inner_text often returns the whole
         # document at every scroll position; sending those repeats can exceed the
         # provider context and TPM limits even when the portal itself is small.
@@ -326,7 +405,7 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         screenshot = await page.screenshot(type="png")
         current_url = page.url
         # Playwright disconnects from Browserbase here; keepAlive lets the remote session survive.
-        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot), "agent_steps": len(evidence_texts), "evidence_chars": len(visible_text)}
+        return {"current_url": current_url, "password_fields": password_fields, "visible_text": visible_text, "tables": tables, "screenshot_bytes": len(screenshot), "agent_steps": len(evidence_texts), "agent_actions": agent_actions, "evidence_chars": len(visible_text)}
 
 
 def process_analysis(run_id: int):
@@ -337,6 +416,8 @@ def process_analysis(run_id: int):
         if not run:
             return
         connector = db.query(Connector).filter(Connector.id == run.connector_id).first()
+        analysis_role = db.query(CorporateRole).filter(CorporateRole.id == run.role_id).first()
+        role_scopes = [scope.label for scope in analysis_role.scopes] if analysis_role else []
         if not connector or connector.status != "authorized" or not connector.browser_session_id:
             run.status = "unavailable"
             run.unavailable_note = "The authorized browser session is no longer available. Authorize the connector again and retry this analysis."
@@ -351,7 +432,7 @@ def process_analysis(run_id: int):
         # second session against the same context returns Browserbase 409.
         if connector.browser_connect_url:
             try:
-                evidence = asyncio.run(inspect_browser_session(connector.browser_connect_url, connector.website_url, navigate=False))
+                evidence = asyncio.run(inspect_browser_session(connector.browser_connect_url, connector.website_url, navigate=False, request=run.request, role_scopes=role_scopes))
             except Exception as exc:
                 session_error = exc
         if evidence is None and connector.browser_context_id:
@@ -359,24 +440,24 @@ def process_analysis(run_id: int):
             connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
             if not connect_url:
                 raise RuntimeError("Browserbase did not return a connection URL for the authorized context")
-            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True))
+            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True, request=run.request, role_scopes=role_scopes))
         if evidence is None:
             debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug")
             connect_url = connector.browser_connect_url or debug.get("wsUrl")
             if not connect_url:
                 raise RuntimeError(f"The authorized Browserbase session is unavailable: {session_error or 'session ended'}")
-            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=False))
+            evidence = asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=False, request=run.request, role_scopes=role_scopes))
         if evidence["password_fields"] > 0:
             run.status = "unavailable"
             run.unavailable_note = "The portal login page is still visible. Weber AI cannot inspect sales data until the authorized session is logged in."
             run.completed_at = now()
             db.commit()
             return
-        evidence_text = json.dumps({"page_url": evidence["current_url"], "agent_steps": evidence.get("agent_steps", 1), "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:24000]
+        evidence_text = json.dumps({"page_url": evidence["current_url"], "agent_steps": evidence.get("agent_steps", 1), "agent_actions": evidence.get("agent_actions", []), "tables": evidence["tables"], "visible_text": evidence["visible_text"]}, ensure_ascii=False)[:24000]
         if client is None:
             result = "The AI provider is not configured, so Weber AI could not generate this report."
         else:
-            system_prompt = "You are Weber Intelligence, a warm and concise corporate analyst. Use only the supplied authorized portal evidence. Calculate only from supplied values and never invent numbers. Briefly explain what you found; if the requested period or metric is not visible, say so plainly and recommend the next helpful step. Include observed figures, comparison or trend, limitations, and next actions."
+            system_prompt = f"You are Weber Intelligence, a warm and concise corporate analyst. Use only the supplied authorized portal evidence. The active role scopes are: {', '.join(role_scopes) or 'none'}. Never reveal or calculate information outside those scopes. Calculate only from supplied values and never invent numbers. Briefly explain what you found; if the requested period or metric is not visible or is outside the active role scope, say so plainly and recommend the next helpful step. Include observed figures, comparison or trend, limitations, and next actions."
             messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Requested analysis: {run.request}\n\nAuthorized portal evidence:\n{evidence_text}"}]
             try:
                 completion = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), temperature=0.2, max_tokens=1800, messages=messages)
@@ -393,7 +474,8 @@ def process_analysis(run_id: int):
         run.status = "completed"
         run.completed_at = now()
         connector.last_analysis_at = now()
-        db.add(Report(workspace_id=run.workspace_id, user_id=run.user_id, analysis_id=run.id, title=run.request[:180], export_format=run.export_format, content=result, source_summary=f"Authorized session: {connector.website_url}; visible page: {evidence['current_url']}", created_at=now()))
+        action_summary = json.dumps(evidence.get("agent_actions", []), ensure_ascii=False)[:1800]
+        db.add(Report(workspace_id=run.workspace_id, user_id=run.user_id, analysis_id=run.id, title=run.request[:180], export_format=run.export_format, content=result, source_summary=f"Authorized session: {connector.website_url}; visible page: {evidence['current_url']}; governed agent actions: {action_summary}", created_at=now()))
         db.commit()
     except Exception as exc:
         print(f"Analysis {run_id} failed: {exc}", flush=True)

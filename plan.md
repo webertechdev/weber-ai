@@ -2,9 +2,9 @@
 
 ## Implementation
 
-Preserve the existing authenticated Next.js/FastAPI corporate workspace and extend it with a reusable, role-aware connector and report layer. The first connector type is a user-authorized browser session for the company website or an additional URL. Weber AI must never receive or store the external website password. A future browser-worker/session bridge will open the target website, let the user authenticate directly, display requested access, and return only approved page evidence to the analysis job.
+Preserve the existing authenticated Next.js/FastAPI corporate workspace and extend it with a reusable, role-aware connector and report layer. The first connector type is a user-authorized browser session for the company website or an additional URL. Weber AI must never receive or store the external website password. The browser worker opens the target website, lets the user authenticate directly, and runs a governed Playwright agent that can inspect, scroll, wait, and click safe same-site controls before returning approved page evidence to the analysis job.
 
-The connector layer stores the website URL, authorization state, allowed page scope, audit timestamps, and revocation state. Analysis runs are user-started only. The analysis request is constrained to the active connector session; if requested information is not visible in that session, the assistant must say it is unavailable and recommend the appropriate IT/admin/data owner. Screenshots and temporary captures are disposable evidence. Generated reports persist for future continuation and comparison.
+The connector layer stores the website URL, authorization state, allowed page scope, audit timestamps, and revocation state. Analysis runs are user-started only. The analysis request is constrained to the active connector session and role scopes; the agent records each bounded action, blocks destructive/account actions, and prevents external navigation. If requested information is not visible or permitted, the assistant must say it is unavailable and recommend the appropriate IT/admin/data owner. Screenshots and temporary captures are disposable evidence. Generated reports persist for future continuation and comparison.
 
 Report export is format-selected by the user. The platform supports text chat by default and prepares PDF, image, Word, Excel/CSV, and PowerPoint export jobs as the corresponding generators are connected. Large browser tables should first use structured page extraction or select-all/copy when no API/export exists; an API/database connector can replace this later.
 
@@ -17,7 +17,7 @@ Project structure:
 
 ## Security boundary
 
-External credentials are entered only in the provider/browser authorization surface. Weber AI does not accept, log, store, or proxy external passwords. Connector access is explicit, revocable, scoped, and tied to the signed-in workspace member and active role. The generic browser worker is intentionally a separate service boundary from the Vercel API; it must be attached before real arbitrary-site navigation is enabled in production.
+External credentials are entered only in the provider/browser authorization surface. Weber AI does not accept, log, store, or proxy external passwords. Connector access is explicit, revocable, scoped, and tied to the signed-in workspace member and active role. The agent may inspect visible content and perform only safe, reversible same-site actions; delete, logout, password, payment, submit, settings, admin, and external-navigation actions are blocked. The generic browser worker is intentionally a separate service boundary from the Vercel API.
 
 ## Design
 
