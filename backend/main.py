@@ -270,6 +270,33 @@ async def _page_snapshot(page):
     return {"url": page.url, "title": await page.title(), "text": text[:18000], "tables": tables, "controls": controls}
 
 
+async def _choose_authenticated_page(context, target_url: str, attempts: int = 6):
+    target_host = urlparse(target_url).netloc.lower()
+    best = None
+    for _ in range(attempts):
+        candidates = []
+        for candidate in context.pages:
+            try:
+                text = (await candidate.locator("body").inner_text(timeout=4000)).strip()
+                table_count = await candidate.locator("table").count()
+                host_match = urlparse(candidate.url).netloc.lower() == target_host if urlparse(candidate.url).netloc else False
+                lower_text = text.lower()
+                signal_score = sum(1500 for signal in ("today's sales", "today’s sales", "today's profit", "today’s profit", "recent sales", "stock value", "sales", "profit") if signal in lower_text)
+                candidates.append(((10000 if host_match else 0) + signal_score + len(text) + table_count * 1000, candidate, text, table_count))
+            except Exception:
+                continue
+        if candidates:
+            best = max(candidates, key=lambda item: item[0])
+            if best[2] or best[3]:
+                await best[1].bring_to_front()
+                return best[1]
+        await asyncio.sleep(1.5)
+    if best:
+        await best[1].bring_to_front()
+        return best[1]
+    return context.pages[0] if context.pages else await context.new_page()
+
+
 async def _run_governed_agent(page, request: str, role_scopes: list[str]):
     """Let the model choose bounded browser actions, never unrestricted clicks."""
     evidence = []
@@ -278,7 +305,9 @@ async def _run_governed_agent(page, request: str, role_scopes: list[str]):
     for step in range(max_steps):
         snapshot = await _page_snapshot(page)
         evidence.append(snapshot)
-        if client is None:
+        if not snapshot["text"] and not snapshot["tables"]:
+            action = {"action": "wait", "reason": "The authenticated page is still rendering"}
+        elif client is None:
             action = {"action": "scroll", "amount": 850, "reason": "Read the next visible portion"} if step < max_steps - 1 else {"action": "finish", "reason": "Bounded evidence collection complete"}
         else:
             planner_prompt = {
@@ -348,22 +377,17 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         # the initial about:blank page was created.
         await page.wait_for_timeout(2500)
         pages = context.pages or pages
-        # Browser sessions can contain an initial about:blank page plus the portal page.
-        # Choose the populated visible page so dashboard cards and sales tables are not lost.
-        candidates = []
-        for candidate in pages:
-            try:
-                text = (await candidate.locator("body").inner_text(timeout=5000)).strip()
-                table_data = await candidate.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
-                lower_text = text.lower()
-                signal_score = sum(1200 for signal in ("today's sales", "today’s sales", "today's profit", "today’s profit", "recent sales", "stock value", "employee", "payment") if signal in lower_text)
-                candidates.append((signal_score + len(text) + sum(len(row) for table in table_data for row in table) * 20, candidate, text, table_data))
-            except Exception:
-                continue
-        if candidates:
-            _, page, visible_text, tables = max(candidates, key=lambda item: item[0])
-        else:
-            visible_text, tables = "", []
+        # Live View may leave an about:blank tab first and render the logged-in
+        # portal in another tab later. Re-discover the best same-site page.
+        page = await _choose_authenticated_page(context, target_url)
+        visible_text = (await page.locator("body").inner_text(timeout=5000)).strip()
+        tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
+        if not visible_text and not tables and urlparse(target_url).netloc:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            page = await _choose_authenticated_page(context, target_url, attempts=3)
+            visible_text = (await page.locator("body").inner_text(timeout=5000)).strip()
+            tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
         password_fields = await page.locator('input[type="password"]:visible').count()
         # Agentic evidence pass: move through the visible page in bounded steps and
         # collect DOM text/tables from each viewport. This is safer and more reliable
@@ -450,6 +474,12 @@ def process_analysis(run_id: int):
         if evidence["password_fields"] > 0:
             run.status = "unavailable"
             run.unavailable_note = "The portal login page is still visible. Weber AI cannot inspect sales data until the authorized session is logged in."
+            run.completed_at = now()
+            db.commit()
+            return
+        if not evidence["visible_text"].strip() and not evidence["tables"]:
+            run.status = "unavailable"
+            run.unavailable_note = "Weber connected to the browser session, but the logged-in portal page returned no visible text or tables. Keep the portal dashboard open in the authorization tab, wait for it to finish loading, then click Check login and retry."
             run.completed_at = now()
             db.commit()
             return
