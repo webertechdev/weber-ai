@@ -389,6 +389,9 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
             visible_text = (await page.locator("body").inner_text(timeout=5000)).strip()
             tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
         password_fields = await page.locator('input[type="password"]:visible').count()
+        login_signals = (page.url + " " + visible_text).lower()
+        if password_fields and not any(signal in login_signals for signal in ("login", "sign in", "signin", "forgot password", "enter password")):
+            password_fields = 0
         # Agentic evidence pass: move through the visible page in bounded steps and
         # collect DOM text/tables from each viewport. This is safer and more reliable
         # than relying on one screenshot, while remaining inside the user-authorized tab.
@@ -735,6 +738,16 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         live_view_url = debug.get("debuggerFullscreenUrl") or debug.get("debuggerUrl")
         if not live_view_url:
             raise HTTPException(status_code=502, detail="Browserbase did not return a Live View URL")
+        # Browserbase sessions open on about:blank by default. Navigate the
+        # authenticated session before handing Live View to the user so the new
+        # tab is populated automatically and the persisted context can render
+        # the portal dashboard immediately.
+        try:
+            asyncio.run(inspect_browser_session(connect_url, connector.website_url, navigate=True, run_agent=False))
+        except Exception:
+            # Keep authorization usable even if the portal needs more time to
+            # render; Check login will retry against the same session.
+            pass
         connector.browser_session_id = session_id
         connector.browser_connect_url = connect_url
         connector.browser_live_view_url = live_view_url
