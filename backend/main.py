@@ -362,7 +362,7 @@ async def _run_governed_agent(page, request: str, role_scopes: list[str]):
     return evidence, actions
 
 
-async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False, request: str = "", role_scopes: list[str] | None = None):
+async def inspect_browser_session(connect_url: str, target_url: str, navigate: bool = False, request: str = "", role_scopes: list[str] | None = None, run_agent: bool = True):
     from playwright.async_api import async_playwright
     async with async_playwright() as playwright:
         worker_headers = {"Authorization": f"Bearer {BROWSER_WORKER_TOKEN}"} if BROWSER_WORKER_URL and connect_url.startswith(BROWSER_WORKER_URL) and BROWSER_WORKER_TOKEN else None
@@ -395,7 +395,7 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
         evidence_texts = [visible_text] if visible_text else []
         evidence_tables = list(tables)
         agent_evidence, agent_actions = ([], [])
-        if password_fields == 0:
+        if password_fields == 0 and run_agent:
             await page.evaluate("window.scrollTo(0, 0)")
             agent_evidence, agent_actions = await _run_governed_agent(page, request, role_scopes or [])
             for snapshot in agent_evidence:
@@ -758,7 +758,7 @@ def check_connector_login(connector_id: int, user: User = Depends(get_current_us
         connect_url = connector.browser_connect_url or debug.get("wsUrl")
         if not connect_url:
             raise HTTPException(status_code=409, detail="The secure browser session has ended. Start authorization again.")
-        inspected = asyncio.run(inspect_browser_session(connect_url, connector.website_url))
+        inspected = asyncio.run(inspect_browser_session(connect_url, connector.website_url, run_agent=False))
         if inspected["password_fields"] > 0:
             connector.status = "authorizing"
             db.commit()
