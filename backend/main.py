@@ -390,7 +390,10 @@ async def inspect_browser_session(connect_url: str, target_url: str, navigate: b
             tables = await page.locator("table").evaluate_all("tables => tables.slice(0, 30).map(table => Array.from(table.querySelectorAll('tr')).map(row => Array.from(row.querySelectorAll('th,td')).map(cell => cell.innerText.trim())))")
         password_fields = await page.locator('input[type="password"]:visible').count()
         login_signals = (page.url + " " + visible_text).lower()
-        if password_fields and not any(signal in login_signals for signal in ("login", "sign in", "signin", "forgot password", "enter password")):
+        dashboard_signals = ("dashboard", "today's sales", "today’s sales", "today's profit", "today’s profit", "recent sales", "stock value", "record sale", "stock management")
+        if any(signal in login_signals for signal in dashboard_signals) and len(visible_text) > 120:
+            password_fields = 0
+        elif password_fields and not any(signal in login_signals for signal in ("login", "sign in", "signin", "forgot password", "enter password")):
             password_fields = 0
         # Agentic evidence pass: move through the visible page in bounded steps and
         # collect DOM text/tables from each viewport. This is safer and more reliable
@@ -463,7 +466,7 @@ def process_analysis(run_id: int):
             except Exception as exc:
                 session_error = exc
         if evidence is None and connector.browser_context_id:
-            analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "browserSettings": {"context": {"id": connector.browser_context_id, "persist": False}}, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}})
+            analysis_session = browserbase_json("POST", "/v1/sessions", {"timeout": 900, "keepAlive": True, "browserSettings": {"context": {"id": connector.browser_context_id, "persist": True}}, "region": "us-east-1", "userMetadata": {"analysis_id": str(run.id), "connector_id": str(connector.id)}})
             connect_url = (analysis_session or {}).get("connectUrl") or (analysis_session or {}).get("connect_url") or (analysis_session or {}).get("wsUrl")
             if not connect_url:
                 raise RuntimeError("Browserbase did not return a connection URL for the authorized context")
