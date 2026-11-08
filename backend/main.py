@@ -6,6 +6,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import time
 import textwrap
@@ -511,7 +512,9 @@ def process_analysis(run_id: int):
         run.completed_at = now()
         connector.last_analysis_at = now()
         action_summary = json.dumps(evidence.get("agent_actions", []), ensure_ascii=False)[:1800]
-        db.add(Report(workspace_id=run.workspace_id, user_id=run.user_id, analysis_id=run.id, title=run.request[:180], export_format=run.export_format, content=result, source_summary=f"Authorized session: {connector.website_url}; visible page: {evidence['current_url']}; governed agent actions: {action_summary}", created_at=now()))
+        evidence_archive = {"page_url": evidence["current_url"], "tables": evidence.get("tables", [])[:20], "visible_text": evidence.get("visible_text", "")[:18000], "agent_actions": evidence.get("agent_actions", [])[:40]}
+        source_summary = "WEBER_EVIDENCE_JSON:" + json.dumps(evidence_archive, ensure_ascii=False)
+        db.add(Report(workspace_id=run.workspace_id, user_id=run.user_id, analysis_id=run.id, title=run.request[:180], export_format=run.export_format, content=result, source_summary=source_summary, created_at=now()))
         db.commit()
     except Exception as exc:
         print(f"Analysis {run_id} failed: {exc}", flush=True)
@@ -946,6 +949,7 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
             raise HTTPException(status_code=404, detail="A completed report is required before exporting")
         role = db.query(CorporateRole).filter(CorporateRole.id == run.role_id, CorporateRole.workspace_id == workspace.id).first()
         connector = db.query(Connector).filter(Connector.id == run.connector_id).first()
+        saved_report = db.query(Report).filter(Report.analysis_id == run.id, Report.workspace_id == workspace.id, Report.user_id == user.id).order_by(Report.id.desc()).first()
         company_name = workspace.name or "Corporate workspace"
         role_name = role.name if role else "Governed analyst"
         content = run.result_text or "No report content was returned."
@@ -966,20 +970,135 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
             for line in report_body.splitlines(): writer.writerow([line])
             output = buffer.getvalue().encode("utf-8"); media_type, extension = "text/csv; charset=utf-8", "csv"
         elif requested == "pdf":
+            from reportlab.lib import colors
             from reportlab.lib.pagesizes import A4
             from reportlab.pdfgen import canvas
+            from reportlab.graphics import renderPDF
+            from reportlab.graphics.shapes import Drawing, String
+            from reportlab.graphics.charts.lineplots import LinePlot
+            from reportlab.graphics.charts.barcharts import VerticalBarChart
+            from reportlab.graphics.charts.piecharts import Pie
+
+            evidence = {}
+            if saved_report and saved_report.source_summary.startswith("WEBER_EVIDENCE_JSON:"):
+                try:
+                    evidence = json.loads(saved_report.source_summary.split("WEBER_EVIDENCE_JSON:", 1)[1])
+                except Exception:
+                    evidence = {}
+            visible_text = evidence.get("visible_text", "")
+            tables = evidence.get("tables", []) or []
+            header = [str(value).strip().lower() for value in (tables[0] if tables else [])]
+            rows = [row for row in (tables[1:] if tables else []) if isinstance(row, list)]
+
+            def number(value):
+                match = re.search(r"-?\d[\d,]*(?:\.\d+)?", str(value or ""))
+                return float(match.group(0).replace(",", "")) if match else None
+
+            def column(*names):
+                for name in names:
+                    for index, label in enumerate(header):
+                        if name in label:
+                            return index
+                return None
+
+            total_col = column("total", "amount", "revenue", "sales")
+            price_col = column("price", "value")
+            qty_col = column("qty", "quantity", "units")
+            item_col = column("item", "product", "service", "description")
+            method_col = column("method", "payment")
+            date_col = column("time", "date", "created")
+            transactions = []
+            for row in rows:
+                if not row:
+                    continue
+                total = number(row[total_col]) if total_col is not None and total_col < len(row) else None
+                if total is None and price_col is not None and price_col < len(row):
+                    total = number(row[price_col])
+                if total is not None:
+                    transactions.append({
+                        "total": total,
+                        "item": str(row[item_col]).strip() if item_col is not None and item_col < len(row) else "Unclassified",
+                        "method": str(row[method_col]).strip() if method_col is not None and method_col < len(row) else "Unspecified",
+                        "date": str(row[date_col]).strip() if date_col is not None and date_col < len(row) else str(len(transactions) + 1),
+                        "qty": number(row[qty_col]) if qty_col is not None and qty_col < len(row) else 1,
+                    })
+            kpis = []
+            for label, patterns in (("Today's sales", (r"today.?s sales\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",)), ("Today's profit", (r"today.?s profit\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",)), ("Stock value", (r"stock value\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",))):
+                match = None
+                for pattern in patterns:
+                    match = re.search(pattern, visible_text, re.IGNORECASE)
+                    if match:
+                        break
+                if match:
+                    kpis.append((label, float(match.group(1).replace(",", ""))))
+            if transactions:
+                kpis.append(("Captured transactions", len(transactions)))
+                kpis.append(("Captured sales", sum(item["total"] for item in transactions)))
+
             buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
-            def page_branding():
-                pdf.saveState(); pdf.translate(width / 2, height / 2); pdf.rotate(35); pdf.setFillColorRGB(.92, .92, .92); pdf.setFont("Helvetica-Bold", 44); pdf.drawCentredString(0, 0, company_name.upper()[:28]); pdf.restoreState()
-                pdf.setFillColorRGB(.15, .15, .15); pdf.setFont("Helvetica", 8); pdf.drawRightString(width - 42, 24, f"{company_name} · {role_name} · Weber AI")
-            page_branding(); y = height - 48
-            pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, y, f"{company_name} — Corporate Intelligence Report"); y -= 20
-            pdf.setFont("Helvetica", 9); pdf.drawString(42, y, f"Prepared by Weber AI · Role: {role_name}"); y -= 15
-            if connector: pdf.drawString(42, y, f"Source: {connector.website_url}"); y -= 15
-            if include_question: pdf.drawString(42, y, question_line[:115]); y -= 22
+            navy = colors.HexColor("#14213d"); blue = colors.HexColor("#3559e8"); teal = colors.HexColor("#16a6a0"); coral = colors.HexColor("#e76f51"); ink = colors.HexColor("#20242d"); muted = colors.HexColor("#6b7280"); paper = colors.HexColor("#f7f8fc")
+            def branding(page_label):
+                pdf.setFillColor(paper); pdf.rect(0, 0, width, height, fill=1, stroke=0)
+                pdf.setFillColor(navy); pdf.rect(0, height - 70, width, 70, fill=1, stroke=0)
+                pdf.setFillColor(colors.white); pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, height - 42, company_name[:48])
+                pdf.setFont("Helvetica", 8); pdf.drawRightString(width - 42, height - 42, "WEBER INTELLIGENCE · GOVERNED REPORT")
+                pdf.setFillColor(muted); pdf.setFont("Helvetica", 7); pdf.drawString(42, 24, f"{company_name} · {role_name} · {page_label}")
+                pdf.drawRightString(width - 42, 24, "Evidence captured from the authorized session")
+                pdf.saveState(); pdf.translate(width / 2, height / 2); pdf.rotate(35); pdf.setFillColorRGB(.88, .90, .94); pdf.setFont("Helvetica-Bold", 42); pdf.drawCentredString(0, 0, company_name.upper()[:26]); pdf.restoreState()
+
+            def title(text, y):
+                pdf.setFillColor(ink); pdf.setFont("Helvetica-Bold", 18); pdf.drawString(42, y, text); return y - 26
+
+            def chart(drawing, x, y):
+                renderPDF.draw(drawing, pdf, x, y)
+
+            branding("Executive overview"); y = height - 108; y = title("Corporate Intelligence Report", y)
+            pdf.setFillColor(muted); pdf.setFont("Helvetica", 9); pdf.drawString(42, y, f"Prepared by Weber AI · Role: {role_name}"); y -= 14
+            if connector: pdf.drawString(42, y, f"Source: {connector.website_url}"); y -= 14
+            pdf.drawString(42, y, f"Requested: {question_line[:115] if include_question and question_line else 'Question omitted by user'}"); y -= 28
+            card_w = (width - 84 - 24) / 3
+            for index, (label, value) in enumerate(kpis[:3]):
+                x = 42 + index * (card_w + 12); pdf.setFillColor(colors.white); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=1, stroke=0); pdf.setStrokeColor(colors.HexColor("#e3e7ef")); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=0, stroke=1); pdf.setFillColor(muted); pdf.setFont("Helvetica", 8); pdf.drawString(x + 12, y - 24, label.upper()); pdf.setFillColor(blue); pdf.setFont("Helvetica-Bold", 16); pdf.drawString(x + 12, y - 48, f"KES {value:,.2f}" if label != "Captured transactions" else f"{int(value):,}")
+            y -= 95
+            pdf.setFillColor(ink); pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Executive summary"); y -= 16
+            pdf.setFont("Helvetica", 9); pdf.setFillColor(ink)
+            summary_lines = textwrap.wrap((report_body if include_explanation else "Explanation omitted at the user’s request.").replace("**", "").replace("```", ""), width=106)
+            for line in summary_lines[:18]:
+                pdf.drawString(42, y, line[:125]); y -= 13
+            pdf.showPage()
+
+            branding("Visual analytics"); y = height - 108; y = title("Visual analytics from captured evidence", y)
+            if not transactions:
+                pdf.setFillColor(ink); pdf.setFont("Helvetica", 10); pdf.drawString(42, y, "No numeric transaction table was captured, so charts are omitted rather than estimated.")
+                pdf.setFont("Helvetica", 9); pdf.setFillColor(muted); pdf.drawString(42, y - 20, "Run the analysis while the portal’s sales table is visible to generate evidence-based charts.")
+            else:
+                values = [item["total"] for item in transactions]
+                line = LinePlot(); line.x = 36; line.y = 24; line.width = 235; line.height = 145; line.data = [[(i + 1, value) for i, value in enumerate(values)]]; line.lines[0].strokeColor = blue; line.lines[0].strokeWidth = 2; line.xValueAxis.valueMin = 1; line.xValueAxis.valueMax = max(2, len(values)); line.yValueAxis.valueMin = 0; line.yValueAxis.labelTextFormat = lambda value: f"{value:,.0f}"; line.xValueAxis.labels.fontSize = 7; line.yValueAxis.labels.fontSize = 7; line_d = Drawing(270, 190); line_d.add(String(36, 178, "Sales curve by captured record", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); line_d.add(line); chart(line_d, 42, y - 205)
+                by_item = {}
+                for item in transactions: by_item[item["item"]] = by_item.get(item["item"], 0) + item["total"]
+                top_items = sorted(by_item.items(), key=lambda pair: pair[1], reverse=True)[:6]
+                bar = VerticalBarChart(); bar.x = 36; bar.y = 24; bar.width = 235; bar.height = 145; bar.data = [[item[1] for item in top_items]]; bar.categoryAxis.categoryNames = [item[0][:12] for item in top_items]; bar.categoryAxis.labels.fontSize = 6; bar.valueAxis.labels.fontSize = 7; bar.bars[0].fillColor = teal; bar.valueAxis.valueMin = 0; bar_d = Drawing(270, 190); bar_d.add(String(36, 178, "Top captured items by sales value", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); bar_d.add(bar); chart(bar_d, 300, y - 205)
+                pie = Pie(); pie.x = 82; pie.y = 18; pie.width = 145; pie.height = 145; by_method = {}; [by_method.__setitem__(item["method"], by_method.get(item["method"], 0) + item["total"]) for item in transactions]; pie.data = list(by_method.values()); pie.labels = [key[:16] for key in by_method]; pie.slices.strokeWidth = 0.5; pie.slices[0].fillColor = blue
+                for idx in range(1, len(pie.data)): pie.slices[idx].fillColor = [teal, coral, colors.HexColor("#f2c14e"), colors.HexColor("#8e7dbe")][(idx - 1) % 5]
+                pie_d = Drawing(270, 190); pie_d.add(String(36, 178, "Payment-method mix", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); pie_d.add(pie); chart(pie_d, 42, y - 410)
+                bins = min(6, max(3, len(values))); low, high = min(values), max(values); step = (high - low) / bins if high > low else 1; counts = [0] * bins
+                for value in values: counts[min(bins - 1, int((value - low) / step))] += 1
+                hist = VerticalBarChart(); hist.x = 36; hist.y = 24; hist.width = 235; hist.height = 145; hist.data = [counts]; hist.categoryAxis.categoryNames = [f"{low + i * step:,.0f}" for i in range(bins)]; hist.categoryAxis.labels.fontSize = 6; hist.valueAxis.labels.fontSize = 7; hist.bars[0].fillColor = coral; hist_d = Drawing(270, 190); hist_d.add(String(36, 178, "Transaction-value histogram", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); hist_d.add(hist); chart(hist_d, 300, y - 410)
+            pdf.showPage()
+
+            branding("Evidence and narrative"); y = height - 108; y = title("Evidence, interpretation, and limitations", y)
+            pdf.setFillColor(muted); pdf.setFont("Helvetica", 8); pdf.drawString(42, y, f"Captured page: {evidence.get('page_url', 'Not recorded')[:120]}"); y -= 20
+            pdf.setFillColor(ink); pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Captured table sample"); y -= 16
+            pdf.setFont("Helvetica", 7)
+            display_rows = ([tables[0]] + rows[:14]) if tables else []
+            for row in display_rows:
+                line = "  |  ".join(str(cell)[:26] for cell in row)
+                if y < 46: pdf.showPage(); branding("Evidence continuation"); y = height - 108; pdf.setFont("Helvetica", 7)
+                pdf.drawString(42, y, line[:145]); y -= 11
+            y -= 10; pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Full narrative"); y -= 16; pdf.setFont("Helvetica", 9)
             for raw_line in report_body.replace("**", "").replace("```", "").splitlines():
                 for line in textwrap.wrap(raw_line, width=105) or [""]:
-                    if y < 44: pdf.showPage(); page_branding(); y = height - 48; pdf.setFont("Helvetica", 9)
+                    if y < 44: pdf.showPage(); branding("Narrative continuation"); y = height - 108; pdf.setFont("Helvetica", 9)
                     pdf.drawString(42, y, line[:130]); y -= 13
             pdf.save(); output = buffer.getvalue(); media_type, extension = "application/pdf", "pdf"
         elif requested in {"word", "docx"}:
