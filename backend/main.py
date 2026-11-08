@@ -1022,11 +1022,26 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
                         "date": str(row[date_col]).strip() if date_col is not None and date_col < len(row) else str(len(transactions) + 1),
                         "qty": number(row[qty_col]) if qty_col is not None and qty_col < len(row) else 1,
                     })
+            narrative_text = re.sub(r"<br\s*/?>", "\n", report_body, flags=re.IGNORECASE)
+            narrative_text = re.sub(r"</?[^>]+>", "", narrative_text)
+            source_for_metrics = visible_text + "\n" + narrative_text
+            def clean_line(raw):
+                cleaned = re.sub(r"<br\s*/?>", " ", str(raw), flags=re.IGNORECASE)
+                cleaned = re.sub(r"</?[^>]+>", "", cleaned).replace("**", "").replace("```", "")
+                cleaned = cleaned.replace("\u202f", " ").replace("\u00a0", " ")
+                return re.sub(r"\s+", " ", cleaned).strip()
+            status_values = {}
+            status_match = re.search(r"status distribution.*?(?:\*\*)?([A-Z][A-Z _-]+)(?:\*\*)?\s*:\s*(\d+)\s*\([^)]*%\).*?(?:\*\*)?([A-Z][A-Z _-]+)(?:\*\*)?\s*:\s*(\d+)\s*\([^)]*%\)", source_for_metrics, re.IGNORECASE | re.DOTALL)
+            if status_match:
+                status_values[clean_line(status_match.group(1)).title()] = int(status_match.group(2))
+                status_values[clean_line(status_match.group(3)).title()] = int(status_match.group(4))
+            total_orders_match = re.search(r"total orders displayed\s*[:|]?\s*\*?\*?(\d+)", source_for_metrics, re.IGNORECASE)
+            total_amount_match = re.search(r"total amount of displayed orders.*?(?:kes\s*)?([\d,]+(?:\.\d+)?)", source_for_metrics, re.IGNORECASE)
             kpis = []
             for label, patterns in (("Today's sales", (r"today.?s sales\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",)), ("Today's profit", (r"today.?s profit\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",)), ("Stock value", (r"stock value\s*(?:kes)?\s*([\d,]+(?:\.\d+)?)",))):
                 match = None
                 for pattern in patterns:
-                    match = re.search(pattern, visible_text, re.IGNORECASE)
+                    match = re.search(pattern, source_for_metrics, re.IGNORECASE)
                     if match:
                         break
                 if match:
@@ -1034,6 +1049,12 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
             if transactions:
                 kpis.append(("Captured transactions", len(transactions)))
                 kpis.append(("Captured sales", sum(item["total"] for item in transactions)))
+            elif total_orders_match:
+                kpis.append(("Orders displayed", int(total_orders_match.group(1))))
+                if total_amount_match:
+                    kpis.append(("Displayed order value", float(total_amount_match.group(1).replace(",", ""))))
+                if status_values:
+                    kpis.append(("Failed / cancelled", sum(status_values.values())))
 
             buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4
             navy = colors.HexColor("#14213d"); blue = colors.HexColor("#3559e8"); teal = colors.HexColor("#16a6a0"); coral = colors.HexColor("#e76f51"); ink = colors.HexColor("#20242d"); muted = colors.HexColor("#6b7280"); paper = colors.HexColor("#f7f8fc")
@@ -1058,32 +1079,45 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
             pdf.drawString(42, y, f"Requested: {question_line[:115] if include_question and question_line else 'Question omitted by user'}"); y -= 28
             card_w = (width - 84 - 24) / 3
             for index, (label, value) in enumerate(kpis[:3]):
-                x = 42 + index * (card_w + 12); pdf.setFillColor(colors.white); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=1, stroke=0); pdf.setStrokeColor(colors.HexColor("#e3e7ef")); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=0, stroke=1); pdf.setFillColor(muted); pdf.setFont("Helvetica", 8); pdf.drawString(x + 12, y - 24, label.upper()); pdf.setFillColor(blue); pdf.setFont("Helvetica-Bold", 16); pdf.drawString(x + 12, y - 48, f"KES {value:,.2f}" if label != "Captured transactions" else f"{int(value):,}")
+                x = 42 + index * (card_w + 12); pdf.setFillColor(colors.white); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=1, stroke=0); pdf.setStrokeColor(colors.HexColor("#e3e7ef")); pdf.roundRect(x, y - 66, card_w, 62, 8, fill=0, stroke=1); pdf.setFillColor(muted); pdf.setFont("Helvetica", 8); pdf.drawString(x + 12, y - 24, label.upper()); pdf.setFillColor(blue); pdf.setFont("Helvetica-Bold", 16); is_money = any(token in label.lower() for token in ("sales", "value", "profit", "revenue")); display_value = f"KES {value:,.2f}" if is_money else f"{int(value):,}"; pdf.drawString(x + 12, y - 48, display_value)
             y -= 95
             pdf.setFillColor(ink); pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Executive summary"); y -= 16
             pdf.setFont("Helvetica", 9); pdf.setFillColor(ink)
-            summary_lines = textwrap.wrap((report_body if include_explanation else "Explanation omitted at the user’s request.").replace("**", "").replace("```", ""), width=106)
+            summary_source = report_body if include_explanation else "Explanation omitted at the user’s request."
+            summary_lines = textwrap.wrap(" ".join(clean_line(line) for line in summary_source.splitlines() if clean_line(line)), width=106)
             for line in summary_lines[:18]:
                 pdf.drawString(42, y, line[:125]); y -= 13
             pdf.showPage()
 
             branding("Visual analytics"); y = height - 108; y = title("Visual analytics from captured evidence", y)
-            if not transactions:
-                pdf.setFillColor(ink); pdf.setFont("Helvetica", 10); pdf.drawString(42, y, "No numeric transaction table was captured, so charts are omitted rather than estimated.")
-                pdf.setFont("Helvetica", 9); pdf.setFillColor(muted); pdf.drawString(42, y - 20, "Run the analysis while the portal’s sales table is visible to generate evidence-based charts.")
+            if not transactions and not status_values:
+                pdf.setFillColor(ink); pdf.setFont("Helvetica", 10); pdf.drawString(42, y, "No numeric transaction or status data was captured, so charts are omitted rather than estimated.")
+                pdf.setFont("Helvetica", 9); pdf.setFillColor(muted); pdf.drawString(42, y - 20, "Run the analysis while the portal’s table or KPI cards are visible to generate evidence-based charts.")
             else:
-                values = [item["total"] for item in transactions]
-                line = LinePlot(); line.x = 36; line.y = 24; line.width = 235; line.height = 145; line.data = [[(i + 1, value) for i, value in enumerate(values)]]; line.lines[0].strokeColor = blue; line.lines[0].strokeWidth = 2; line.xValueAxis.valueMin = 1; line.xValueAxis.valueMax = max(2, len(values)); line.yValueAxis.valueMin = 0; line.yValueAxis.labelTextFormat = lambda value: f"{value:,.0f}"; line.xValueAxis.labels.fontSize = 7; line.yValueAxis.labels.fontSize = 7; line_d = Drawing(270, 190); line_d.add(String(36, 178, "Sales curve by captured record", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); line_d.add(line); chart(line_d, 42, y - 205)
+                values = [item["total"] for item in transactions] if transactions else list(status_values.values())
+                line_title = "Sales value by captured record" if transactions else "Order-status counts"
+                bar_title = "Top captured items by sales value" if transactions else "Order status counts"
+                pie_title = "Payment-method mix" if transactions else "Order status distribution"
+                histogram_title = "Transaction-value histogram" if transactions else "Status-count distribution"
+                line = LinePlot(); line.x = 36; line.y = 24; line.width = 235; line.height = 145; line.data = [[(i + 1, value) for i, value in enumerate(values)]]; line.lines[0].strokeColor = blue; line.lines[0].strokeWidth = 2; line.xValueAxis.valueMin = 1; line.xValueAxis.valueMax = max(2, len(values)); line.yValueAxis.valueMin = 0; line.yValueAxis.labelTextFormat = lambda value: f"{value:,.0f}"; line.xValueAxis.labels.fontSize = 7; line.yValueAxis.labels.fontSize = 7; line_d = Drawing(270, 190); line_d.add(String(36, 178, line_title, fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); line_d.add(line); chart(line_d, 42, y - 205)
                 by_item = {}
-                for item in transactions: by_item[item["item"]] = by_item.get(item["item"], 0) + item["total"]
+                if transactions:
+                    for item in transactions: by_item[item["item"]] = by_item.get(item["item"], 0) + item["total"]
+                else:
+                    by_item = status_values.copy()
                 top_items = sorted(by_item.items(), key=lambda pair: pair[1], reverse=True)[:6]
-                bar = VerticalBarChart(); bar.x = 36; bar.y = 24; bar.width = 235; bar.height = 145; bar.data = [[item[1] for item in top_items]]; bar.categoryAxis.categoryNames = [item[0][:12] for item in top_items]; bar.categoryAxis.labels.fontSize = 6; bar.valueAxis.labels.fontSize = 7; bar.bars[0].fillColor = teal; bar.valueAxis.valueMin = 0; bar_d = Drawing(270, 190); bar_d.add(String(36, 178, "Top captured items by sales value", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); bar_d.add(bar); chart(bar_d, 300, y - 205)
-                pie = Pie(); pie.x = 82; pie.y = 18; pie.width = 145; pie.height = 145; by_method = {}; [by_method.__setitem__(item["method"], by_method.get(item["method"], 0) + item["total"]) for item in transactions]; pie.data = list(by_method.values()); pie.labels = [key[:16] for key in by_method]; pie.slices.strokeWidth = 0.5; pie.slices[0].fillColor = blue
+                bar = VerticalBarChart(); bar.x = 36; bar.y = 24; bar.width = 235; bar.height = 145; bar.data = [[item[1] for item in top_items]]; bar.categoryAxis.categoryNames = [item[0][:12] for item in top_items]; bar.categoryAxis.labels.fontSize = 6; bar.valueAxis.labels.fontSize = 7; bar.bars[0].fillColor = teal; bar.valueAxis.valueMin = 0; bar_d = Drawing(270, 190); bar_d.add(String(36, 178, bar_title, fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); bar_d.add(bar); chart(bar_d, 300, y - 205)
+                pie = Pie(); pie.x = 82; pie.y = 18; pie.width = 145; pie.height = 145; by_method = {}
+                if transactions:
+                    [by_method.__setitem__(item["method"], by_method.get(item["method"], 0) + item["total"]) for item in transactions]
+                else:
+                    by_method = status_values.copy()
+                pie.data = list(by_method.values()); pie.labels = [key[:16] for key in by_method]; pie.slices.strokeWidth = 0.5; pie.slices[0].fillColor = blue
                 for idx in range(1, len(pie.data)): pie.slices[idx].fillColor = [teal, coral, colors.HexColor("#f2c14e"), colors.HexColor("#8e7dbe")][(idx - 1) % 5]
-                pie_d = Drawing(270, 190); pie_d.add(String(36, 178, "Payment-method mix", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); pie_d.add(pie); chart(pie_d, 42, y - 410)
+                pie_d = Drawing(270, 190); pie_d.add(String(36, 178, pie_title, fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); pie_d.add(pie); chart(pie_d, 42, y - 410)
                 bins = min(6, max(3, len(values))); low, high = min(values), max(values); step = (high - low) / bins if high > low else 1; counts = [0] * bins
                 for value in values: counts[min(bins - 1, int((value - low) / step))] += 1
-                hist = VerticalBarChart(); hist.x = 36; hist.y = 24; hist.width = 235; hist.height = 145; hist.data = [counts]; hist.categoryAxis.categoryNames = [f"{low + i * step:,.0f}" for i in range(bins)]; hist.categoryAxis.labels.fontSize = 6; hist.valueAxis.labels.fontSize = 7; hist.bars[0].fillColor = coral; hist_d = Drawing(270, 190); hist_d.add(String(36, 178, "Transaction-value histogram", fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); hist_d.add(hist); chart(hist_d, 300, y - 410)
+                hist = VerticalBarChart(); hist.x = 36; hist.y = 24; hist.width = 235; hist.height = 145; hist.data = [counts]; hist.categoryAxis.categoryNames = [f"{low + i * step:,.0f}" for i in range(bins)]; hist.categoryAxis.labels.fontSize = 6; hist.valueAxis.labels.fontSize = 7; hist.bars[0].fillColor = coral; hist_d = Drawing(270, 190); hist_d.add(String(36, 178, histogram_title, fontName="Helvetica-Bold", fontSize=9, fillColor=ink)); hist_d.add(hist); chart(hist_d, 300, y - 410)
             pdf.showPage()
 
             branding("Evidence and narrative"); y = height - 108; y = title("Evidence, interpretation, and limitations", y)
@@ -1091,13 +1125,21 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
             pdf.setFillColor(ink); pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Captured table sample"); y -= 16
             pdf.setFont("Helvetica", 7)
             display_rows = ([tables[0]] + rows[:14]) if tables else []
+            if not display_rows:
+                markdown_rows = []
+                for raw in narrative_text.splitlines():
+                    if "|" in raw and "---" not in raw:
+                        cells = [clean_line(cell) for cell in raw.strip().strip("|").split("|")]
+                        if len(cells) >= 2: markdown_rows.append(cells)
+                display_rows = markdown_rows[:15]
             for row in display_rows:
                 line = "  |  ".join(str(cell)[:26] for cell in row)
                 if y < 46: pdf.showPage(); branding("Evidence continuation"); y = height - 108; pdf.setFont("Helvetica", 7)
                 pdf.drawString(42, y, line[:145]); y -= 11
             y -= 10; pdf.setFont("Helvetica-Bold", 11); pdf.drawString(42, y, "Full narrative"); y -= 16; pdf.setFont("Helvetica", 9)
-            for raw_line in report_body.replace("**", "").replace("```", "").splitlines():
-                for line in textwrap.wrap(raw_line, width=105) or [""]:
+            for raw_line in narrative_text.splitlines():
+                cleaned = clean_line(raw_line)
+                for line in textwrap.wrap(cleaned, width=105) or [""]:
                     if y < 44: pdf.showPage(); branding("Narrative continuation"); y = height - 108; pdf.setFont("Helvetica", 9)
                     pdf.drawString(42, y, line[:130]); y -= 13
             pdf.save(); output = buffer.getvalue(); media_type, extension = "application/pdf", "pdf"
