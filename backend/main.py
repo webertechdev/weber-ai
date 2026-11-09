@@ -137,13 +137,28 @@ class Message(BaseModel):
     content: str
 
 
+class ImageAttachment(BaseModel):
+    name: str = Field(max_length=160)
+    media_type: str = Field(pattern=r"^image/(png|jpeg|jpg|webp)$")
+    data_url: str = Field(max_length=4_000_000)
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12000)
     messages: list[Message] = Field(default_factory=list)
     conversation_id: int
+    report_id: int | None = None
     role_id: int | None = None
     role: str = "ADMIN"
     scopes: list[str] = Field(default_factory=list)
+    attachments: list[ImageAttachment] = Field(default_factory=list, max_length=1)
+
+
+class ChatExportRequest(BaseModel):
+    conversation_id: int
+    format: str = Field(pattern="^(pdf|word|excel|csv|image|powerpoint|text)$")
+    include_question: bool = True
+    include_explanation: bool = True
 
 
 class RoleCreate(BaseModel):
@@ -1031,10 +1046,12 @@ def export_analysis(analysis_id: int, format: str = "text", include_question: bo
                 cleaned = cleaned.replace("\u202f", " ").replace("\u00a0", " ")
                 return re.sub(r"\s+", " ", cleaned).strip()
             status_values = {}
-            status_match = re.search(r"status distribution.*?(?:\*\*)?([A-Z][A-Z _-]+)(?:\*\*)?\s*:\s*(\d+)\s*\([^)]*%\).*?(?:\*\*)?([A-Z][A-Z _-]+)(?:\*\*)?\s*:\s*(\d+)\s*\([^)]*%\)", source_for_metrics, re.IGNORECASE | re.DOTALL)
-            if status_match:
-                status_values[clean_line(status_match.group(1)).title()] = int(status_match.group(2))
-                status_values[clean_line(status_match.group(3)).title()] = int(status_match.group(4))
+            status_area = re.search(r"status distribution(.*?)(?:total amount|most recent|key observations|limitations)", source_for_metrics, re.IGNORECASE | re.DOTALL)
+            status_source = status_area.group(1) if status_area else source_for_metrics
+            for status_match in re.finditer(r"(?:\*\*|\|\s*)?([A-Z][A-Z _-]{2,}?)(?:\*\*)?\s*:\s*(\d+)\s*\(\s*\d+\s*%", status_source, re.IGNORECASE):
+                label = clean_line(status_match.group(1)).strip(" |:-").title()
+                if label.lower() not in {"status distribution", "total amount", "most recent", "earliest displayed order date"}:
+                    status_values[label] = int(status_match.group(2))
             total_orders_match = re.search(r"total orders displayed\s*[:|]?\s*\*?\*?(\d+)", source_for_metrics, re.IGNORECASE)
             total_amount_match = re.search(r"total amount of displayed orders.*?(?:kes\s*)?([\d,]+(?:\.\d+)?)", source_for_metrics, re.IGNORECASE)
             kpis = []
@@ -1212,6 +1229,71 @@ def get_messages(conversation_id: int, user: User = Depends(get_current_user)):
         db.close()
 
 
+@app.post("/api/conversations/export")
+def export_conversation(payload: ChatExportRequest, user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        workspace, role = workspace_for_user(db, user)
+        conversation = db.query(Conversation).filter(Conversation.id == payload.conversation_id, Conversation.user_id == user.id, Conversation.workspace_id == workspace.id).first()
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        messages = db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation.id).order_by(ChatMessage.id).all()
+        lines = []
+        for item in messages:
+            if not payload.include_question and item.role == "user":
+                continue
+            if not payload.include_explanation and item.role == "assistant":
+                continue
+            label = "YOU" if item.role == "user" else "WEBER INTELLIGENCE"
+            lines.append(f"{label}: {item.content}")
+        body = "\n\n".join(lines) or "No chat messages are available for export."
+        requested = payload.format.lower(); safe_name = f"weber-chat-{conversation.id}"
+        output = body.encode("utf-8"); media_type = "text/plain; charset=utf-8"; extension = "txt"
+        if requested == "csv":
+            buffer = io.StringIO(); writer = csv.writer(buffer); writer.writerow([workspace.name, "Weber AI conversation"]); writer.writerow(["Role", "Message"])
+            for item in messages:
+                if (not payload.include_question and item.role == "user") or (not payload.include_explanation and item.role == "assistant"):
+                    continue
+                writer.writerow([item.role, item.content])
+            output = buffer.getvalue().encode("utf-8"); media_type, extension = "text/csv; charset=utf-8", "csv"
+        elif requested == "pdf":
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            buffer = io.BytesIO(); pdf = canvas.Canvas(buffer, pagesize=A4); width, height = A4; y = height - 60
+            pdf.setFillColorRGB(.08, .13, .24); pdf.rect(0, height - 78, width, 78, fill=1, stroke=0); pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 16); pdf.drawString(42, height - 45, f"{workspace.name} — Weber AI conversation")
+            pdf.setFillColorRGB(.12, .12, .12); pdf.setFont("Helvetica", 9)
+            for raw in body.splitlines():
+                for line in textwrap.wrap(raw, width=105) or [""]:
+                    if y < 45: pdf.showPage(); y = height - 48; pdf.setFont("Helvetica", 9)
+                    pdf.drawString(42, y, line[:130]); y -= 13
+            pdf.save(); output = buffer.getvalue(); media_type, extension = "application/pdf", "pdf"
+        elif requested == "word":
+            from docx import Document
+            document = Document(); document.add_heading(f"{workspace.name} — Weber AI conversation", 0); document.add_paragraph(f"Role: {role.name}")
+            for paragraph in body.splitlines(): document.add_paragraph(paragraph)
+            buffer = io.BytesIO(); document.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"
+        elif requested == "excel":
+            from openpyxl import Workbook
+            workbook = Workbook(); sheet = workbook.active; sheet.title = "Conversation"; sheet.append([workspace.name, "Weber AI conversation"]); sheet.append(["Role", "Message"])
+            for item in messages: sheet.append([item.role, item.content])
+            buffer = io.BytesIO(); workbook.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+        elif requested == "powerpoint":
+            from pptx import Presentation
+            presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = f"{workspace.name} — Weber AI conversation"; slide.placeholders[1].text = f"Role: {role.name}"
+            for chunk in textwrap.wrap(body, width=800):
+                slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = "Conversation"; slide.placeholders[1].text = chunk
+            buffer = io.BytesIO(); presentation.save(buffer); output = buffer.getvalue(); media_type, extension = "application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"
+        elif requested == "image":
+            from PIL import Image, ImageDraw
+            wrapped = [line for raw in body.splitlines() for line in (textwrap.wrap(raw, width=100) or [""])]
+            image = Image.new("RGB", (1400, max(260, 130 + len(wrapped) * 23)), "#f8f6f1"); draw = ImageDraw.Draw(image); draw.text((54, 38), f"{workspace.name} — Weber AI conversation", fill="#14213d"); draw.text((54, 77), f"Role: {role.name}", fill="#6b7280")
+            for index, line in enumerate(wrapped): draw.text((54, 125 + index * 23), line, fill="#20242d")
+            buffer = io.BytesIO(); image.save(buffer, format="PNG"); output = buffer.getvalue(); media_type, extension = "image/png", "png"
+        return StreamingResponse(io.BytesIO(output), media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{safe_name}.{extension}"'})
+    finally:
+        db.close()
+
+
 @app.post("/api/stream")
 def stream_chat(request: ChatRequest, user: User = Depends(get_current_user)):
     db = SessionLocal()
@@ -1222,6 +1304,9 @@ def stream_chat(request: ChatRequest, user: User = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Conversation not found")
     chosen_role = db.query(CorporateRole).filter(CorporateRole.id == (request.role_id or member_role.id), CorporateRole.workspace_id == workspace.id).first() or member_role
     scope_labels = [scope.label for scope in chosen_role.scopes]
+    saved_report = None
+    if request.report_id:
+        saved_report = db.query(Report).filter(Report.analysis_id == request.report_id, Report.workspace_id == workspace.id, Report.user_id == user.id).order_by(Report.id.desc()).first()
     db.close()
 
     def event_generator():
@@ -1234,16 +1319,30 @@ def stream_chat(request: ChatRequest, user: User = Depends(get_current_user)):
                 return
             scope_text = ", ".join(scope_labels) or "No data scopes granted"
             system_prompt = f"""You are Weber Intelligence, a governed corporate AI assistant for {workspace.name}, a {workspace.industry} company. The active user role is {chosen_role.name}. Their permitted information scopes are: {scope_text}. Only answer using information within those scopes. If asked for restricted information, explain that the request is outside this role's boundary and suggest an ADMIN review. Be concise, analytical, and action-oriented. Structure business analysis with a short conclusion, evidence, assumptions, and recommended next actions. Never invent company metrics; say when source data has not been connected."""
+            if saved_report:
+                report_context = (saved_report.content or "")[:14000]
+                source_context = (saved_report.source_summary or "")[:12000]
+                system_prompt += f"\n\nSAVED REPORT CONTEXT (analysis {request.report_id}):\n{report_context}\n\nSAVED EVIDENCE SUMMARY:\n{source_context}\nThe user is continuing from this saved report. Treat it as the primary reference, preserve its figures, and clearly distinguish captured facts from requested projections. If the user asks for a chart, first state the chart purpose, data series, labels, values, and limitations using only this context. You may use a compact markdown table for chart data."
             full_messages = [{"role": "system", "content": system_prompt}]
             full_messages.extend({"role": msg.role, "content": msg.content} for msg in request.messages[-10:])
-            full_messages.append({"role": "user", "content": request.message})
-            stream = client.chat.completions.create(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"), messages=full_messages, temperature=0.4, stream=True)
+            user_content = request.message
+            saved_user_content = request.message
+            if request.attachments:
+                attachment = request.attachments[0]
+                user_content = [{"type": "text", "text": request.message or f"Analyze the uploaded image {attachment.name} using the permitted corporate context."}, {"type": "image_url", "image_url": {"url": attachment.data_url}}]
+                saved_user_content = f"{request.message or 'Analyze uploaded image'} [image attached: {attachment.name}]"
+            full_messages.append({"role": "user", "content": user_content})
+            model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct") if request.attachments else os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+            stream = client.chat.completions.create(model=model, messages=full_messages, temperature=0.4, stream=True)
             full_response = ""
             for chunk in stream:
                 content = chunk.choices[0].delta.content
                 if content:
                     full_response += content
                     yield content
+            user_message = stream_db.query(ChatMessage).filter(ChatMessage.conversation_id == conversation.id, ChatMessage.role == "user").order_by(ChatMessage.id.desc()).first()
+            if user_message:
+                user_message.content = saved_user_content
             stream_db.add(ChatMessage(role="assistant", content=full_response, conversation_id=conversation.id, created_at=now()))
             stream_db.commit()
         except Exception as exc:
