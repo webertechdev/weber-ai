@@ -728,10 +728,32 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
             raise HTTPException(status_code=404, detail="Connector not found")
         if connector.browser_session_id:
             try:
-                browserbase_json("POST", f"/v1/sessions/{connector.browser_session_id}", {"status": "REQUEST_RELEASE"})
-                time.sleep(1.5)
+                # Reconnect must preserve the session that contains the user's cookies.
+                debug = browserbase_json("GET", f"/v1/sessions/{connector.browser_session_id}/debug?ttl=900")
+                refreshed_live_view = debug.get("debuggerFullscreenUrl") or debug.get("debuggerUrl")
+                refreshed_connect_url = debug.get("wsUrl") or connector.browser_connect_url
+                if refreshed_live_view and (refreshed_connect_url or connector.browser_connect_url):
+                    connector.browser_live_view_url = refreshed_live_view
+                    if refreshed_connect_url:
+                        connector.browser_connect_url = refreshed_connect_url
+                    if connector.status not in {"authorized", "authorizing"}:
+                        connector.status = "authorizing"
+                    db.commit()
+                    return {"connector": serialize_connector(connector), "authorization_status": connector.status, "authorization_url": refreshed_live_view, "reused": True, "role": role.name, "message": "The existing secure browser session is ready. Weber kept the current website login; continue in the Live View and return here when needed."}
             except HTTPException:
                 pass
+            # The remote session is genuinely gone. Clear volatile references,
+            # retain the persistent context, and create a replacement session.
+            try:
+                browserbase_json("POST", f"/v1/sessions/{connector.browser_session_id}", {"status": "REQUEST_RELEASE"})
+            except HTTPException:
+                pass
+            connector.browser_session_id = None
+            connector.browser_connect_url = None
+            connector.browser_live_view_url = None
+            connector.session_started_at = None
+            connector.status = "authorization_required"
+            db.commit()
         if not connector.browser_context_id:
             # Disconnect deliberately clears the old context. Use a unique
             # name so an orphaned Browserbase context can never block a new
@@ -775,7 +797,7 @@ def authorize_connector(connector_id: int, user: User = Depends(get_current_user
         connector.session_started_at = now()
         connector.status = "authorizing"
         db.commit()
-        return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": live_view_url, "role": role.name, "message": "The secure Weber AI browser is ready. Sign in inside the secure browser view, then return to Weber AI and click Check login. Your website password stays inside the isolated browser session."}
+        return {"connector": serialize_connector(connector), "authorization_status": "authorizing", "authorization_url": live_view_url, "reused": False, "role": role.name, "message": "The secure Weber AI browser is ready. Sign in inside the secure browser view, then return to Weber AI and click Check login. Your website password stays inside the isolated browser session."}
     finally:
         db.close()
 
