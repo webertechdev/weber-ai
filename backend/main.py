@@ -10,6 +10,8 @@ import re
 import secrets
 import time
 import textwrap
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -139,8 +141,8 @@ class Message(BaseModel):
 
 class ImageAttachment(BaseModel):
     name: str = Field(max_length=160)
-    media_type: str = Field(pattern=r"^image/(png|jpeg|jpg|webp)$")
-    data_url: str = Field(max_length=4_000_000)
+    media_type: str = Field(max_length=160)
+    data_url: str = Field(max_length=16_000_000)
 
 
 class ChatRequest(BaseModel):
@@ -151,7 +153,7 @@ class ChatRequest(BaseModel):
     role_id: int | None = None
     role: str = "ADMIN"
     scopes: list[str] = Field(default_factory=list)
-    attachments: list[ImageAttachment] = Field(default_factory=list, max_length=1)
+    attachments: list[ImageAttachment] = Field(default_factory=list, max_length=3)
 
 
 class ChatExportRequest(BaseModel):
@@ -202,6 +204,78 @@ def normalized_website(value: str) -> str:
 
 def website_domain(value: str) -> str:
     return urlparse(normalized_website(value)).netloc.lower().removeprefix("www.").split(":")[0]
+
+
+def _attachment_bytes(data_url: str) -> tuple[str, bytes]:
+    header, encoded = data_url.split(",", 1) if "," in data_url else ("", data_url)
+    media_type = header[5:].split(";", 1)[0].lower() if header.startswith("data:") else "application/octet-stream"
+    return media_type, base64.b64decode(encoded, validate=False)
+
+
+def _xml_text(raw: bytes) -> str:
+    try:
+        root = ET.fromstring(raw)
+        return " ".join(part.strip() for part in root.itertext() if part and part.strip())
+    except Exception:
+        return ""
+
+
+def _extract_attachment_text(attachment: ImageAttachment) -> str:
+    """Extract bounded, non-executable text from user files; never execute archives."""
+    name = attachment.name.lower()
+    media_type, raw = _attachment_bytes(attachment.data_url)
+    is_image = media_type.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+    if is_image:
+        return ""
+    chunks: list[str] = []
+    try:
+        if name.endswith(".pdf") or media_type == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw))
+            for page in reader.pages[:30]:
+                chunks.append(page.extract_text() or "")
+        elif name.endswith(".csv") or name.endswith(".tsv") or media_type in {"text/csv", "text/tab-separated-values"}:
+            chunks.append(raw.decode("utf-8", errors="replace"))
+        elif name.endswith((".txt", ".md", ".log", ".json", ".xml", ".html", ".htm")) or media_type.startswith("text/"):
+            chunks.append(raw.decode("utf-8", errors="replace"))
+        elif name.endswith(".xlsx") or name.endswith(".xlsm"):
+            from openpyxl import load_workbook
+            workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            for sheet in workbook.worksheets[:12]:
+                chunks.append(f"Sheet: {sheet.title}")
+                for row in sheet.iter_rows(max_row=500, values_only=True):
+                    values = [str(value) for value in row if value is not None]
+                    if values: chunks.append(" | ".join(values))
+        elif name.endswith(".docx") or name.endswith(".pptx"):
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                prefixes = ("word/",) if name.endswith(".docx") else ("ppt/",)
+                for member in archive.namelist():
+                    if member.startswith(prefixes) and member.endswith(".xml") and "media/" not in member:
+                        chunks.append(_xml_text(archive.read(member)))
+        elif name.endswith(".zip") or media_type in {"application/zip", "application/x-zip-compressed"}:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                for member in archive.infolist()[:200]:
+                    safe_name = member.filename.replace("\\", "/")
+                    if member.is_dir() or safe_name.startswith("/") or ".." in safe_name.split("/"):
+                        continue
+                    if member.file_size > 2_000_000:
+                        continue
+                    lower = safe_name.lower()
+                    chunks.append(f"Archive file: {safe_name}")
+                    if lower.endswith((".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".log")):
+                        chunks.append(archive.read(member).decode("utf-8", errors="replace"))
+                    elif lower.endswith((".docx", ".pptx")):
+                        for nested in zipfile.ZipFile(io.BytesIO(archive.read(member))).namelist():
+                            if nested.endswith(".xml") and (nested.startswith("word/") or nested.startswith("ppt/")):
+                                chunks.append(_xml_text(zipfile.ZipFile(io.BytesIO(archive.read(member))).read(nested)))
+                    elif lower.endswith((".xlsx", ".xlsm")):
+                        chunks.append("Spreadsheet file included; upload it separately for cell-level extraction.")
+        else:
+            chunks.append(raw[:1_000_000].decode("utf-8", errors="replace"))
+    except Exception as exc:
+        return f"The file could not be fully parsed ({exc.__class__.__name__}). Use the filename and any readable content only."
+    text = "\n".join(chunk.strip() for chunk in chunks if chunk and chunk.strip())
+    return text[:80_000]
 
 
 def serialize_connector(connector: Connector):
@@ -1349,13 +1423,37 @@ def stream_chat(request: ChatRequest, user: User = Depends(get_current_user)):
             full_messages.extend({"role": msg.role, "content": msg.content} for msg in request.messages[-10:])
             user_content = request.message
             saved_user_content = request.message
-            if request.attachments:
-                attachment = request.attachments[0]
-                user_content = [{"type": "text", "text": request.message or f"Analyze the uploaded image {attachment.name} using the permitted corporate context."}, {"type": "image_url", "image_url": {"url": attachment.data_url}}]
-                saved_user_content = f"{request.message or 'Analyze uploaded image'} [image attached: {attachment.name}]"
+            image_parts = []
+            file_context = []
+            attachment_names = []
+            for attachment in request.attachments:
+                attachment_names.append(attachment.name)
+                media_type = attachment.media_type.lower()
+                if media_type.startswith("image/") or attachment.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                    image_parts.append({"type": "image_url", "image_url": {"url": attachment.data_url}})
+                else:
+                    extracted = _extract_attachment_text(attachment)
+                    file_context.append(f"FILE: {attachment.name}\n{extracted or 'No readable text was extracted from this file.'}")
+            if image_parts or file_context:
+                prompt = request.message or "Analyze the attached files using the permitted corporate context."
+                if file_context:
+                    prompt += "\n\nEXTRACTED FILE CONTENT:\n" + "\n\n".join(file_context)
+                user_content = [{"type": "text", "text": prompt}] + image_parts
+                saved_user_content = f"{request.message or 'Analyze uploaded files'} [attachments: {', '.join(attachment_names)}]"
             full_messages.append({"role": "user", "content": user_content})
-            model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct") if request.attachments else os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-            stream = client.chat.completions.create(model=model, messages=full_messages, temperature=0.4, stream=True)
+            has_images = bool(image_parts)
+            requested_model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b") if has_images else os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+            stream = None
+            try:
+                stream = client.chat.completions.create(model=requested_model, messages=full_messages, temperature=0.4, stream=True)
+            except Exception as model_error:
+                error_text = str(model_error).lower()
+                if has_images and ("model_not_found" in error_text or "does not exist" in error_text or "not found" in error_text):
+                    # Older deployments may still have the retired Llama vision ID
+                    # saved in GROQ_VISION_MODEL. Fall back to Groq's current vision model.
+                    stream = client.chat.completions.create(model="qwen/qwen3.8-27b", messages=full_messages, temperature=0.4, stream=True)
+                else:
+                    raise
             full_response = ""
             for chunk in stream:
                 content = chunk.choices[0].delta.content

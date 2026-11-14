@@ -8,6 +8,7 @@ psycopg[binary]
 httpx
 playwright
 reportlab
+pypdf
 python-docx
 openpyxl
 python-pptx
